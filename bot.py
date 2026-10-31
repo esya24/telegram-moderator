@@ -78,6 +78,24 @@ CREATE TABLE IF NOT EXISTS violations (
 )
 """)
 db.commit()
+db.execute("""
+CREATE TABLE IF NOT EXISTS chat_users (
+ chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, username TEXT, full_name TEXT,
+ PRIMARY KEY (chat_id, user_id)
+)
+""")
+db.commit()
+
+def remember_user(chat_id: int, user):
+    if user:
+        db.execute("""INSERT INTO chat_users(chat_id,user_id,username,full_name) VALUES(?,?,?,?)
+        ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username, full_name=excluded.full_name""",
+        (chat_id,user.id,(user.username or "").lower(),user.full_name or ""))
+        db.commit()
+
+def find_user_by_username(chat_id: int, username: str):
+    return db.execute("SELECT user_id FROM chat_users WHERE chat_id=? AND username=?",
+        (chat_id, username.lower().lstrip("@"))).fetchone()
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -106,60 +124,13 @@ async def admin_check(chat_id: int, user_id: int) -> bool:
     return member.status in ("administrator", "creator")
 
 def mention(user) -> str:
-    # HTML mention reliably points to Telegram profile, even without username.
+    # Prefer @username; fall back to a clickable name if no username exists.
+    if user.username:
+        return "@" + user.username
     safe_name = (user.full_name or "Пользователь")
     safe_name = (safe_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
     return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
 
-@dp.message(F.text)
-async def moderation(message: Message):
-    if not message.from_user or message.from_user.is_bot:
-        return
-    try:
-        if await admin_check(message.chat.id, message.from_user.id):
-            return
-    except Exception:
-        return
-
-    if not contains_swear(message.text):
-        return
-
-    try:
-        await message.delete()
-    except Exception:
-        pass
-
-    now = datetime.now(timezone.utc)
-    chat_id, user_id = message.chat.id, message.from_user.id
-    count = current_count(chat_id, user_id, now) + 1
-    save_count(chat_id, user_id, count, now)
-    tag = mention(message.from_user)
-
-    if count <= WARNING_LIMIT:
-        left = WARNING_LIMIT - count
-        msg = (f"⚠️ {tag}, предупреждение {count}/{WARNING_LIMIT} за мат."
-               + (f" До мута осталось предупреждений: {left}." if left else
-                  " Следующее нарушение — мут на 15 минут."))
-        await message.answer(msg, parse_mode="HTML")
-        return
-
-    try:
-        until = now + timedelta(minutes=MUTE_MINUTES)
-        await bot.restrict_chat_member(
-            chat_id, user_id,
-            permissions=ChatPermissions(can_send_messages=False),
-            until_date=until
-        )
-        await message.answer(
-            f"🔇 {tag} получил мут на {MUTE_MINUTES} минут.\n"
-            f"Причина: мат. Нарушение №{count}.",
-            parse_mode="HTML"
-        )
-    except Exception:
-        await message.answer(
-            f"⚠️ {tag}: нарушение №{count}, но мут не удалось выдать. Проверьте права бота.",
-            parse_mode="HTML"
-        )
 
 @dp.message(Command("warns"))
 async def warns(message: Message):
@@ -211,28 +182,87 @@ async def mute_command(message: Message):
 async def unmute_command(message: Message):
     if not message.from_user or not await admin_check(message.chat.id, message.from_user.id):
         return
-    reply = message.reply_to_message
-    if not reply or not reply.from_user:
-        await message.answer("Ответь на сообщение пользователя командой /unmute.")
+    args = (message.text or "").split(maxsplit=1)
+    target = None
+    if len(args)>1 and args[1].strip().startswith("@"):
+        username=args[1].strip().split()[0].lstrip("@")
+        row=find_user_by_username(message.chat.id, username)
+        if row:
+            try:
+                target=(await bot.get_chat_member(message.chat.id,row[0])).user
+            except Exception:
+                target=None
+        if not target:
+            await message.answer(f"Не нашёл @{username}. Пользователь должен написать хотя бы раз в группе. "
+                               "Или ответь на его сообщение командой /unmute.")
+            return
+    elif message.reply_to_message and message.reply_to_message.from_user:
+        target=message.reply_to_message.from_user
+    else:
+        await message.answer("Используй /unmute @username или ответь на сообщение пользователя командой /unmute.")
         return
-    target = reply.from_user
-    await bot.restrict_chat_member(
-        message.chat.id, target.id,
-        permissions=ChatPermissions(
-            can_send_messages=True, can_send_audios=True,
-            can_send_documents=True, can_send_photos=True,
-            can_send_videos=True, can_send_video_notes=True,
-            can_send_voice_notes=True, can_send_polls=True,
-            can_send_other_messages=True, can_add_web_page_previews=True
+    try:
+        await bot.restrict_chat_member(message.chat.id,target.id,permissions=ChatPermissions(
+            can_send_messages=True,can_send_audios=True,can_send_documents=True,can_send_photos=True,
+            can_send_videos=True,can_send_video_notes=True,can_send_voice_notes=True,
+            can_send_polls=True,can_send_other_messages=True,can_add_web_page_previews=True))
+    except Exception:
+        await message.answer("Не удалось снять мут. Проверь права бота на ограничение участников.")
+        return
+    db.execute("DELETE FROM violations WHERE chat_id=? AND user_id=?",(message.chat.id,target.id)); db.commit()
+    await message.answer(f"🔊 {mention(target)} размьючен. Предупреждения сброшены.",parse_mode="HTML")
+
+@dp.message(F.text)
+async def moderation(message: Message):
+    if not message.from_user or message.from_user.is_bot:
+        return
+    remember_user(message.chat.id, message.from_user)
+    try:
+        if await admin_check(message.chat.id, message.from_user.id):
+            return
+    except Exception:
+        return
+
+    if not contains_swear(message.text):
+        return
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+    now = datetime.now(timezone.utc)
+    chat_id, user_id = message.chat.id, message.from_user.id
+    count = current_count(chat_id, user_id, now) + 1
+    save_count(chat_id, user_id, count, now)
+    tag = mention(message.from_user)
+
+    if count <= WARNING_LIMIT:
+        left = WARNING_LIMIT - count
+        msg = (f"⚠️ {tag}, предупреждение {count}/{WARNING_LIMIT} за мат."
+               + (f" До мута осталось предупреждений: {left}." if left else
+                  " Следующее нарушение — мут на 15 минут."))
+        await message.answer(msg, parse_mode="HTML")
+        return
+
+    try:
+        until = now + timedelta(minutes=MUTE_MINUTES)
+        await bot.restrict_chat_member(
+            chat_id, user_id,
+            permissions=ChatPermissions(can_send_messages=False),
+            until_date=until
         )
-    )
-    db.execute("DELETE FROM violations WHERE chat_id=? AND user_id=?",
-               (message.chat.id, target.id))
-    db.commit()
-    await message.answer(
-        f"🔊 {mention(target)} размьючен. Предупреждения сброшены.",
-        parse_mode="HTML"
-    )
+        await message.answer(
+            f"🔇 {tag} получил мут на {MUTE_MINUTES} минут.\n"
+            f"Причина: мат. Нарушение №{count}.",
+            parse_mode="HTML"
+        )
+    except Exception:
+        await message.answer(
+            f"⚠️ {tag}: нарушение №{count}, но мут не удалось выдать. Проверьте права бота.",
+            parse_mode="HTML"
+        )
+
 
 async def main():
     print("Moderator running")

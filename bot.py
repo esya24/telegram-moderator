@@ -10,48 +10,62 @@ from aiogram.types import Message, ChatPermissions
 
 TOKEN = os.getenv("BOT_TOKEN")
 if not TOKEN:
-    raise RuntimeError("Не задан BOT_TOKEN. Добавьте токен в Secrets / переменные окружения.")
+    raise RuntimeError("Set BOT_TOKEN in hosting environment variables.")
 
 DB_PATH = os.getenv("DB_PATH", "moderation.sqlite3")
 WARNING_LIMIT = 3
 MUTE_MINUTES = 15
 RESET_AFTER_DAYS = 7
 
-# Список можно расширять. Фильтр проверяет отдельные слова и распространённые обходы.
-BAD_WORDS = {
-    "бля", "блять", "блядь", "блядина", "бляди",
-    "сука", "суки", "сучка",
-    "хуй", "хуи", "хуя", "хуе", "хуев", "хуёв", "хер",
-    "пизда", "пизде", "пизду", "пиздеть", "пиздец",
-    "ебать", "ебал", "ебала", "ебет", "ебёт", "ебаный", "ебанутый",
-    "нахуй", "охуел", "охуеть", "заебал", "заебись",
-    "мудак", "мудила", "гандон", "долбоеб", "долбоёб",
-    "уебок", "уёбок", "шлюха", "выеб"
-}
-
-TRANSLATE = str.maketrans({
-    "ё": "е", "0": "о", "1": "и", "3": "з",
-    "4": "ч", "6": "б", "8": "в", "@": "а", "$": "с"
+# Mixed Cyrillic/Latin lookalikes -> Cyrillic. Covers common obfuscation.
+LOOKALIKE_MAP = str.maketrans({
+    "a":"а", "A":"а", "c":"с", "C":"с", "e":"е", "E":"е",
+    "o":"о", "O":"о", "p":"р", "P":"р", "x":"х", "X":"х",
+    "y":"у", "Y":"у", "k":"к", "K":"к", "m":"м", "M":"м",
+    "t":"т", "T":"т", "b":"в", "B":"в", "h":"н", "H":"н",
+    "i":"і", "I":"і", "l":"л", "L":"л"
+})
+DIGIT_MAP = str.maketrans({
+    "0":"о", "1":"и", "3":"з", "4":"ч", "5":"с",
+    "6":"б", "7":"т", "8":"в", "9":"я", "@":"а", "$":"с"
 })
 
+# Broad Russian profanity roots. Review/edit this list for your community.
+PROFANITY_ROOTS = {
+    "бля", "бляд", "блять", "блят", "блядин",
+    "сука", "сук", "суч", "сучар",
+    "хуй", "хуя", "хуе", "хуи", "хуёв", "хуев", "хер",
+    "пизд", "пизд", "пиздец", "пизда",
+    "еб", "ёб", "йоб", "заеб", "заёб", "наеб", "наёб",
+    "уеб", "уёб", "выеб", "выёб", "въеб", "въёб",
+    "муд", "мудак", "мудил",
+    "гандон", "гондон", "манд", "залуп", "шлюх",
+    "дроч", "дрис", "перд", "срал", "срать", "говн",
+    "жоп", "сволоч", "сукин", "пидор", "пидар",
+    "даун", "чмо", "fuck", "shit", "bitch", "asshole"
+}
+
+# A small allowlist helps avoid accidental matches in common innocent words.
+ALLOW_WORDS = {
+    "бляха", "блядь", # remove if you prefer strict filtering
+    "перед", "пердеть"  # edit as desired; these can be false-positive-prone
+}
+
 def normalize(text: str) -> str:
-    text = text.lower().translate(TRANSLATE)
-    # Заменяем разделители пробелами, чтобы слова не склеивались.
-    text = re.sub(r"[^а-я]+", " ", text)
-    # Убираем повторение букв: "бляяяя" -> "бля".
-    words = []
-    for word in text.split():
-        word = re.sub(r"(.)\1{2,}", r"\1\1", word)
-        words.append(word)
-    return " ".join(words)
+    text = text.lower().replace("ё", "е")
+    text = text.translate(LOOKALIKE_MAP).translate(DIGIT_MAP)
+    # Keep only letters; punctuation/spacing is removed to catch separators.
+    text = re.sub(r"[^а-я]", "", text)
+    # Collapse long repetitions: "суууука" -> "сука", "бляяяя" -> "бля"
+    text = re.sub(r"(.)\1{1,}", r"\1", text)
+    return text
 
 def contains_swear(text: str) -> bool:
-    words = normalize(text).split()
-    for token in words:
-        for bad in BAD_WORDS:
-            if token == bad or (len(bad) >= 4 and bad in token):
-                return True
-    return False
+    norm = normalize(text)
+    if not norm:
+        return False
+    # Search for roots in normalized string, including words with inserted punctuation.
+    return any(root in norm for root in PROFANITY_ROOTS)
 
 db = sqlite3.connect(DB_PATH)
 db.execute("""
@@ -68,41 +82,43 @@ db.commit()
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-def get_violation_count(chat_id: int, user_id: int, now: datetime) -> int:
+def current_count(chat_id: int, user_id: int, now: datetime) -> int:
     row = db.execute(
         "SELECT count, last_violation FROM violations WHERE chat_id=? AND user_id=?",
         (chat_id, user_id)
     ).fetchone()
+    if not row:
+        return 0
+    last = datetime.fromisoformat(row[1])
+    return row[0] if now - last <= timedelta(days=RESET_AFTER_DAYS) else 0
 
-    if row:
-        last = datetime.fromisoformat(row[1])
-        if now - last <= timedelta(days=RESET_AFTER_DAYS):
-            return row[0]
-    return 0
-
-def save_violation(chat_id: int, user_id: int, count: int, now: datetime) -> None:
+def save_count(chat_id: int, user_id: int, count: int, now: datetime):
     db.execute("""
-        INSERT INTO violations(chat_id, user_id, count, last_violation)
-        VALUES (?, ?, ?, ?)
-        ON CONFLICT(chat_id, user_id)
-        DO UPDATE SET count=excluded.count, last_violation=excluded.last_violation
+        INSERT INTO violations(chat_id,user_id,count,last_violation)
+        VALUES(?,?,?,?)
+        ON CONFLICT(chat_id,user_id)
+        DO UPDATE SET count=excluded.count,last_violation=excluded.last_violation
     """, (chat_id, user_id, count, now.isoformat()))
     db.commit()
 
-async def is_admin(chat_id: int, user_id: int) -> bool:
+async def admin_check(chat_id: int, user_id: int) -> bool:
     member = await bot.get_chat_member(chat_id, user_id)
     return member.status in ("administrator", "creator")
 
+def mention(user) -> str:
+    # HTML mention reliably points to Telegram profile, even without username.
+    safe_name = (user.full_name or "Пользователь")
+    safe_name = (safe_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+    return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
+
 @dp.message(F.text)
-async def moderate(message: Message):
+async def moderation(message: Message):
     if not message.from_user or message.from_user.is_bot:
         return
-
     try:
-        if await is_admin(message.chat.id, message.from_user.id):
+        if await admin_check(message.chat.id, message.from_user.id):
             return
     except Exception:
-        # Если Telegram не дал проверить статус, не применяем наказание вслепую.
         return
 
     if not contains_swear(message.text):
@@ -111,47 +127,38 @@ async def moderate(message: Message):
     try:
         await message.delete()
     except Exception:
-        # Без права удаления бот всё равно сообщит о нарушении.
         pass
 
     now = datetime.now(timezone.utc)
-    chat_id = message.chat.id
-    user_id = message.from_user.id
-    count = get_violation_count(chat_id, user_id, now) + 1
-    save_violation(chat_id, user_id, count, now)
-    name = message.from_user.full_name
+    chat_id, user_id = message.chat.id, message.from_user.id
+    count = current_count(chat_id, user_id, now) + 1
+    save_count(chat_id, user_id, count, now)
+    tag = mention(message.from_user)
 
     if count <= WARNING_LIMIT:
-        remaining = WARNING_LIMIT - count
-        if remaining:
-            text = (
-                f"⚠️ {name}, предупреждение {count}/{WARNING_LIMIT} за мат. "
-                f"До санкций осталось предупреждений: {remaining}."
-            )
-        else:
-            text = (
-                f"⚠️ {name}, это третье предупреждение из {WARNING_LIMIT}. "
-                "Следующее нарушение приведёт к муту на 15 минут."
-            )
-        await message.answer(text)
+        left = WARNING_LIMIT - count
+        msg = (f"⚠️ {tag}, предупреждение {count}/{WARNING_LIMIT} за мат."
+               + (f" До мута осталось предупреждений: {left}." if left else
+                  " Следующее нарушение — мут на 15 минут."))
+        await message.answer(msg, parse_mode="HTML")
         return
 
-    until = now + timedelta(minutes=MUTE_MINUTES)
     try:
+        until = now + timedelta(minutes=MUTE_MINUTES)
         await bot.restrict_chat_member(
-            chat_id=chat_id,
-            user_id=user_id,
+            chat_id, user_id,
             permissions=ChatPermissions(can_send_messages=False),
             until_date=until
         )
         await message.answer(
-            f"🔇 {name} получил мут на {MUTE_MINUTES} минут. "
-            f"Всего нарушений: {count}. Следующее нарушение — ещё 15 минут мута."
+            f"🔇 {tag} получил мут на {MUTE_MINUTES} минут.\n"
+            f"Причина: мат. Нарушение №{count}.",
+            parse_mode="HTML"
         )
     except Exception:
         await message.answer(
-            f"⚠️ {name}, зафиксировано нарушение №{count}, но выдать мут не удалось. "
-            "Проверьте права бота."
+            f"⚠️ {tag}: нарушение №{count}, но мут не удалось выдать. Проверьте права бота.",
+            parse_mode="HTML"
         )
 
 @dp.message(Command("warns"))
@@ -159,73 +166,76 @@ async def warns(message: Message):
     if not message.from_user:
         return
     now = datetime.now(timezone.utc)
-    count = get_violation_count(message.chat.id, message.from_user.id, now)
+    count = current_count(message.chat.id, message.from_user.id, now)
     await message.answer(
-        f"Твои нарушения за последние {RESET_AFTER_DAYS} дней: {count}.\n"
-        f"Первые {WARNING_LIMIT} — предупреждения; далее каждый мат — мут на {MUTE_MINUTES} минут."
+        f"Нарушений за последние {RESET_AFTER_DAYS} дней: {count}. "
+        f"Первые {WARNING_LIMIT} — предупреждения; далее мут {MUTE_MINUTES} минут."
     )
 
 @dp.message(Command("rules"))
 async def rules(message: Message):
     await message.answer(
-        "📜 Правила чата:\n"
-        f"1. За первые {WARNING_LIMIT} нарушения за 7 дней выдаются предупреждения.\n"
-        f"2. Начиная с {WARNING_LIMIT + 1}-го нарушения — мут на {MUTE_MINUTES} минут.\n"
-        f"3. Каждое последующее нарушение — ещё {MUTE_MINUTES} минут мута.\n"
-        f"4. Счётчик обнуляется после {RESET_AFTER_DAYS} дней без нарушений."
+        f"📜 Правила: первые {WARNING_LIMIT} нарушения за {RESET_AFTER_DAYS} дней — предупреждения; "
+        f"с {WARNING_LIMIT + 1}-го — мут на {MUTE_MINUTES} минут за каждое нарушение. "
+        "Счётчик сбрасывается после {RESET_AFTER_DAYS} дней без нарушений."
     )
 
 @dp.message(Command("mute"))
-async def manual_mute(message: Message):
-    if not message.from_user or not await is_admin(message.chat.id, message.from_user.id):
+async def mute_command(message: Message):
+    if not message.from_user or not await admin_check(message.chat.id, message.from_user.id):
         return
-    if not message.reply_to_message or not message.reply_to_message.from_user:
-        await message.answer("Ответь на сообщение пользователя командой /mute или /mute 15.")
+    reply = message.reply_to_message
+    if not reply or not reply.from_user:
+        await message.answer("Ответь на сообщение пользователя: /mute или /mute 45")
         return
     args = (message.text or "").split()
     try:
-        minutes = int(args[1]) if len(args) > 1 else 15
-        if minutes < 1 or minutes > 10080:
+        minutes = int(args[1]) if len(args) > 1 else MUTE_MINUTES
+        if not 1 <= minutes <= 10080:
             raise ValueError
     except ValueError:
-        await message.answer("Укажи время от 1 до 10080 минут.")
+        await message.answer("Укажи число минут от 1 до 10080.")
         return
-    target = message.reply_to_message.from_user
-    until = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    target = reply.from_user
     await bot.restrict_chat_member(
         message.chat.id, target.id,
         permissions=ChatPermissions(can_send_messages=False),
-        until_date=until
+        until_date=datetime.now(timezone.utc) + timedelta(minutes=minutes)
     )
-    await message.answer(f"🔇 {target.full_name} замьючен на {minutes} минут.")
+    await message.answer(
+        f"🔇 {mention(target)} принудительно замьючен на {minutes} минут.",
+        parse_mode="HTML"
+    )
 
 @dp.message(Command("unmute"))
-async def manual_unmute(message: Message):
-    if not message.from_user or not await is_admin(message.chat.id, message.from_user.id):
+async def unmute_command(message: Message):
+    if not message.from_user or not await admin_check(message.chat.id, message.from_user.id):
         return
-    if not message.reply_to_message or not message.reply_to_message.from_user:
+    reply = message.reply_to_message
+    if not reply or not reply.from_user:
         await message.answer("Ответь на сообщение пользователя командой /unmute.")
         return
-    target = message.reply_to_message.from_user
+    target = reply.from_user
     await bot.restrict_chat_member(
         message.chat.id, target.id,
         permissions=ChatPermissions(
-            can_send_messages=True,
-            can_send_audios=True,
-            can_send_documents=True,
-            can_send_photos=True,
-            can_send_videos=True,
-            can_send_video_notes=True,
-            can_send_voice_notes=True,
-            can_send_polls=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True
+            can_send_messages=True, can_send_audios=True,
+            can_send_documents=True, can_send_photos=True,
+            can_send_videos=True, can_send_video_notes=True,
+            can_send_voice_notes=True, can_send_polls=True,
+            can_send_other_messages=True, can_add_web_page_previews=True
         )
     )
-    await message.answer(f"🔊 {target.full_name} размьючен.")
+    db.execute("DELETE FROM violations WHERE chat_id=? AND user_id=?",
+               (message.chat.id, target.id))
+    db.commit()
+    await message.answer(
+        f"🔊 {mention(target)} размьючен. Предупреждения сброшены.",
+        parse_mode="HTML"
+    )
 
 async def main():
-    print("Модератор запущен.")
+    print("Moderator running")
     await dp.start_polling(bot)
 
 if __name__ == "__main__":

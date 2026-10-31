@@ -104,7 +104,14 @@ async def mute(m:Message):
     try: minutes=int(args[1]) if len(args)>1 else MUTE_MINUTES; assert 1<=minutes<=10080
     except (ValueError,AssertionError): await m.answer('Укажи число минут от 1 до 10080.');return
     try:
-        await bot.restrict_chat_member(m.chat.id,target.id,permissions=ChatPermissions(can_send_messages=False),until_date=datetime.now(timezone.utc)+timedelta(minutes=minutes))
+        until=datetime.now(timezone.utc)+timedelta(minutes=minutes)
+        await bot.restrict_chat_member(m.chat.id,target.id,permissions=ChatPermissions(can_send_messages=False),until_date=until)
+        appeal_kb=InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text='⚖️ Обжаловать мут',callback_data=f'appeal_start:{m.chat.id}')
+        ]])
+        await bot.send_message(m.chat.id,
+            f'🔇 {mention(target)} получил мут на {minutes} минут. Если это ошибка, можно обжаловать:',
+            parse_mode='HTML',reply_markup=appeal_kb)
         await m.answer(f'🔇 {mention(target)} замьючен на {minutes} минут.',parse_mode='HTML')
     except Exception as e: logging.exception('mute failed'); await m.answer('Не удалось выдать мут. Проверь права бота (ограничение участников).')
 @dp.message(Command('unmute'))
@@ -133,6 +140,15 @@ async def appeal_start(c:CallbackQuery):
     except (ValueError,AttributeError): await c.answer('Некорректная кнопка.',show_alert=True); return
     if c.message is None or c.message.chat.id != cid:
         await c.answer('Кнопка больше недействительна.',show_alert=True); return
+    try:
+        member=await bot.get_chat_member(cid,c.from_user.id)
+        # Only a currently restricted member can start an appeal.
+        if getattr(member,'status',None) not in ('restricted',):
+            await c.answer('Обжаловать мут могут только замьюченные участники.',show_alert=True); return
+        if getattr(member,'can_send_messages',True):
+            await c.answer('У тебя нет активного мута.',show_alert=True); return
+    except Exception:
+        await c.answer('Не удалось проверить статус мута. Попробуй позже.',show_alert=True); return
     key=(cid,c.from_user.id)
     pending_appeals[key]=c.message.message_id
     await c.answer()

@@ -153,7 +153,7 @@ async def appeal_start(c:CallbackQuery):
     pending_appeals[key]=c.message.message_id
     await c.answer()
     try:
-        await bot.send_message(c.from_user.id, f'Отправь одним сообщением причину обжалования мута в чате {c.message.chat.title}.\\nЧтобы отменить, напиши /cancel.')
+        await bot.send_message(c.from_user.id, f'Отправь одним сообщением причину обжалования мута в чате {c.message.chat.title}.\nЧтобы отменить, напиши /cancel.')
         await c.message.answer(f'{mention(c.from_user)}, причина обжалования запрошена в личных сообщениях бота.', parse_mode='HTML')
     except Exception:
         pending_appeals.pop(key, None)
@@ -212,7 +212,7 @@ async def private_appeal_reason(m:Message):
     ]])
     reason=(m.text or '').strip().replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')[:3000]
     await m.answer('Обжалование отправлено администраторам.')
-    await bot.send_message(cid, f'📨 <b>Обжалование мута</b> от {mention(m.from_user)} (ID {uid})\\n\\n<b>Причина:</b>\\n{reason}',parse_mode='HTML',reply_markup=keyboard)
+    await bot.send_message(cid, f'📨 <b>Обжалование мута</b> от {mention(m.from_user)} (ID {uid})\n\n<b>Причина:</b>\n{reason}',parse_mode='HTML',reply_markup=keyboard)
 
 @dp.message(F.text | F.caption)
 async def moderation(m:Message):

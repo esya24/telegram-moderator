@@ -152,7 +152,12 @@ async def appeal_start(c:CallbackQuery):
     key=(cid,c.from_user.id)
     pending_appeals[key]=c.message.message_id
     await c.answer()
-    await c.message.answer(f'{mention(c.from_user)}, отправь одним сообщением причину обжалования.\nЧтобы отменить, напиши /cancel.')
+    try:
+        await bot.send_message(c.from_user.id, f'Отправь одним сообщением причину обжалования мута в чате {c.message.chat.title}.\\nЧтобы отменить, напиши /cancel.')
+        await c.message.answer(f'{mention(c.from_user)}, причина обжалования запрошена в личных сообщениях бота.', parse_mode='HTML')
+    except Exception:
+        pending_appeals.pop(key, None)
+        await c.message.answer(f'{mention(c.from_user)}, сначала открой личный чат с ботом и нажми /start, затем повтори обжалование.', parse_mode='HTML')
 
 @dp.message(Command('cancel'))
 async def cancel_appeal(m:Message):
@@ -187,23 +192,27 @@ async def appeal_decide(c:CallbackQuery):
     await c.message.answer(result)
     await c.answer('Решение сохранено.')
 
-@dp.message(F.text | F.caption)
-async def capture_appeal(m:Message):
-    if not m.from_user or not (m.text or m.caption): return
-    key=(m.chat.id,m.from_user.id)
-    if key not in pending_appeals: return
-    reason=(m.text or m.caption or '').strip()
-    if reason.startswith('/cancel'): pending_appeals.pop(key,None); await m.answer('Обжалование отменено.'); return
-    pending_appeals.pop(key,None)
-    appeal_id=uuid.uuid4().hex[:12]
-    active_appeals[appeal_id]=key
+@dp.message(F.chat.type == 'private', F.text)
+async def private_appeal_reason(m:Message):
+    if not m.from_user: return
+    matches=[key for key in pending_appeals if key[1]==m.from_user.id]
+    if not matches: return
+    if (m.text or '').startswith('/cancel'):
+        for key in matches: pending_appeals.pop(key,None)
+        await m.answer('Обжалование отменено.')
+        return
+    if len(matches)>1:
+        await m.answer('Несколько активных обжалований. Нажми кнопку в нужной группе и повтори.')
+        return
+    cid,uid=matches[0]; pending_appeals.pop(matches[0],None)
+    appeal_id=uuid.uuid4().hex[:12]; active_appeals[appeal_id]=(cid,uid)
     keyboard=InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text='✅ Принять и снять мут',callback_data=f'appeal_decide:approve:{appeal_id}'),
         InlineKeyboardButton(text='❌ Отклонить',callback_data=f'appeal_decide:reject:{appeal_id}')
     ]])
-    safe_reason=reason.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')[:3000]
+    reason=(m.text or '').strip().replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')[:3000]
     await m.answer('Обжалование отправлено администраторам.')
-    await bot.send_message(m.chat.id, f'📨 <b>Обжалование мута</b> от {mention(m.from_user)} (ID {m.from_user.id})\n\n<b>Причина:</b>\n{safe_reason}',parse_mode='HTML',reply_markup=keyboard)
+    await bot.send_message(cid, f'📨 <b>Обжалование мута</b> от {mention(m.from_user)} (ID {uid})\\n\\n<b>Причина:</b>\\n{reason}',parse_mode='HTML',reply_markup=keyboard)
 
 @dp.message(F.text | F.caption)
 async def moderation(m:Message):

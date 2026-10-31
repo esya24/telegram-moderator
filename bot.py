@@ -1,8 +1,8 @@
-import asyncio, os, re, sqlite3, logging
+import asyncio, os, re, sqlite3, logging, uuid
 from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
-from aiogram.types import Message, ChatPermissions
+from aiogram.types import Message, ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 
 logging.basicConfig(level=logging.INFO)
 TOKEN=os.getenv('BOT_TOKEN')
@@ -72,6 +72,10 @@ def save_count(chat_id,user_id,count,now):
     db.execute('''INSERT INTO violations VALUES(?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET
     count=excluded.count,last_violation=excluded.last_violation''',(chat_id,user_id,count,now.isoformat()));db.commit()
 
+# Appeals: one active draft per user per chat; moderator decisions are callback-protected.
+pending_appeals = {}  # (chat_id, user_id) -> original mute message id
+active_appeals = {}   # appeal_id -> (chat_id, user_id)
+
 bot=Bot(TOKEN); dp=Dispatcher()
 async def is_admin(chat_id,user_id):
     m=await bot.get_chat_member(chat_id,user_id); return m.status in ('administrator','creator')
@@ -123,6 +127,68 @@ async def unmute(m:Message):
         await m.answer(f'🔊 {mention(target)} размьючен. Предупреждения сброшены.',parse_mode='HTML')
     except Exception: logging.exception('unmute failed'); await m.answer('Не удалось снять мут. Проверь права бота.')
 
+@dp.callback_query(F.data.startswith('appeal_start:'))
+async def appeal_start(c:CallbackQuery):
+    try: cid=int(c.data.split(':',1)[1])
+    except (ValueError,AttributeError): await c.answer('Некорректная кнопка.',show_alert=True); return
+    if c.message is None or c.message.chat.id != cid:
+        await c.answer('Кнопка больше недействительна.',show_alert=True); return
+    key=(cid,c.from_user.id)
+    pending_appeals[key]=c.message.message_id
+    await c.answer()
+    await c.message.answer(f'{mention(c.from_user)}, отправь одним сообщением причину обжалования.\nЧтобы отменить, напиши /cancel.')
+
+@dp.message(Command('cancel'))
+async def cancel_appeal(m:Message):
+    if m.from_user and pending_appeals.pop((m.chat.id,m.from_user.id),None) is not None:
+        await m.answer('Обжалование отменено.')
+
+@dp.callback_query(F.data.startswith('appeal_decide:'))
+async def appeal_decide(c:CallbackQuery):
+    try:
+        _, decision, appeal_id = c.data.split(':',2)
+        cid, uid = active_appeals[appeal_id]
+    except (ValueError,KeyError,AttributeError):
+        await c.answer('Обжалование уже обработано или недействительно.',show_alert=True); return
+    if c.message is None or c.message.chat.id != cid:
+        await c.answer('Недействительная заявка.',show_alert=True); return
+    try:
+        if not await is_admin(cid,c.from_user.id):
+            await c.answer('Решение доступно только администраторам.',show_alert=True); return
+    except Exception:
+        await c.answer('Не удалось проверить права.',show_alert=True); return
+    active_appeals.pop(appeal_id,None)
+    if decision=='approve':
+        try:
+            await bot.restrict_chat_member(cid,uid,permissions=ChatPermissions(can_send_messages=True,can_send_audios=True,can_send_documents=True,can_send_photos=True,can_send_videos=True,can_send_video_notes=True,can_send_voice_notes=True,can_send_polls=True,can_send_other_messages=True,can_add_web_page_previews=True))
+            db.execute('DELETE FROM violations WHERE chat_id=? AND user_id=?',(cid,uid)); db.commit()
+            result='✅ Обжалование принято. Мут снят, счётчик предупреждений сброшен.'
+        except Exception:
+            logging.exception('appeal unmute failed'); result='⚠️ Не удалось снять мут. Проверьте права бота.'
+    else:
+        result='❌ Обжалование отклонено. Мут остаётся активным.'
+    await c.message.edit_reply_markup(reply_markup=None)
+    await c.message.answer(result)
+    await c.answer('Решение сохранено.')
+
+@dp.message(F.text | F.caption)
+async def capture_appeal(m:Message):
+    if not m.from_user or not (m.text or m.caption): return
+    key=(m.chat.id,m.from_user.id)
+    if key not in pending_appeals: return
+    reason=(m.text or m.caption or '').strip()
+    if reason.startswith('/cancel'): pending_appeals.pop(key,None); await m.answer('Обжалование отменено.'); return
+    pending_appeals.pop(key,None)
+    appeal_id=uuid.uuid4().hex[:12]
+    active_appeals[appeal_id]=key
+    keyboard=InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text='✅ Принять и снять мут',callback_data=f'appeal_decide:approve:{appeal_id}'),
+        InlineKeyboardButton(text='❌ Отклонить',callback_data=f'appeal_decide:reject:{appeal_id}')
+    ]])
+    safe_reason=reason.replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')[:3000]
+    await m.answer('Обжалование отправлено администраторам.')
+    await bot.send_message(m.chat.id, f'📨 <b>Обжалование мута</b> от {mention(m.from_user)} (ID {m.from_user.id})\n\n<b>Причина:</b>\n{safe_reason}',parse_mode='HTML',reply_markup=keyboard)
+
 @dp.message(F.text | F.caption)
 async def moderation(m:Message):
     u=m.from_user
@@ -143,7 +209,7 @@ async def moderation(m:Message):
         await m.answer(msg,parse_mode='HTML');return
     try:
         await bot.restrict_chat_member(cid,uid,permissions=ChatPermissions(can_send_messages=False),until_date=now+timedelta(minutes=MUTE_MINUTES))
-        await m.answer(f'🔇 {tag} получил мут на {MUTE_MINUTES} минут. Нарушение №{count}.',parse_mode='HTML')
+        await m.answer(f'🔇 {tag} получил мут на {MUTE_MINUTES} минут. Нарушение №{count}.',parse_mode='HTML',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⚖️ Обжаловать мут',callback_data=f'appeal_start:{cid}')]]))
     except Exception: logging.exception('automatic mute failed'); await m.answer(f'⚠️ {tag}: нарушение №{count}, но мут не удалось выдать. Проверь права бота.',parse_mode='HTML')
 
 async def main():

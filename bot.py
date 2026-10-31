@@ -212,7 +212,10 @@ async def private_appeal_reason(m:Message):
     ]])
     reason=(m.text or '').strip().replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')[:3000]
     await m.answer('Обжалование отправлено администраторам.')
-    await bot.send_message(cid, f'📨 <b>Обжалование мута</b> от {mention(m.from_user)} (ID {uid})\n\n<b>Причина:</b>\n{reason}',parse_mode='HTML',reply_markup=keyboard)
+    appeal_text = f'📨 <b>Обжалование мута</b> от {mention(m.from_user)} (ID {uid})\n\n<b>Причина:</b>\n{reason}'
+    # Defensive normalization: convert literal backslash-n sequences to real line breaks.
+    appeal_text = appeal_text.replace(r'\n', '\n')
+    await bot.send_message(cid, appeal_text, parse_mode='HTML', reply_markup=keyboard)
 
 @dp.message(F.text | F.caption)
 async def moderation(m:Message):

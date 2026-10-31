@@ -1,317 +1,152 @@
-import asyncio
-import os
-import re
-import sqlite3
+import asyncio, os, re, sqlite3, logging
 from datetime import datetime, timedelta, timezone
-
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, ChatPermissions
 
-TOKEN = os.getenv("BOT_TOKEN")
-if not TOKEN:
-    raise RuntimeError("Set BOT_TOKEN in hosting environment variables.")
+logging.basicConfig(level=logging.INFO)
+TOKEN=os.getenv('BOT_TOKEN')
+if not TOKEN: raise RuntimeError('Set BOT_TOKEN environment variable')
+DB_PATH=os.getenv('DB_PATH','moderation.sqlite3')
+WARNING_LIMIT=int(os.getenv('WARNING_LIMIT','3')); MUTE_MINUTES=int(os.getenv('MUTE_MINUTES','15')); RESET_AFTER_DAYS=int(os.getenv('RESET_AFTER_DAYS','7'))
 
-DB_PATH = os.getenv("DB_PATH", "moderation.sqlite3")
-WARNING_LIMIT = 3
-MUTE_MINUTES = 15
-RESET_AFTER_DAYS = 7
-
-# Mixed Cyrillic/Latin lookalikes -> Cyrillic. Covers common obfuscation.
-LOOKALIKE_MAP = str.maketrans({
-    "a":"а", "A":"а", "c":"с", "C":"с", "e":"е", "E":"е",
-    "o":"о", "O":"о", "p":"р", "P":"р", "x":"х", "X":"х",
-    "y":"у", "Y":"у", "k":"к", "K":"к", "m":"м", "M":"м",
-    "t":"т", "T":"т", "b":"в", "B":"в", "h":"н", "H":"н",
-    "i":"і", "I":"і", "l":"л", "L":"л"
-})
-DIGIT_MAP = str.maketrans({
-    "0":"о", "1":"и", "3":"з", "4":"ч", "5":"с",
-    "6":"б", "7":"т", "8":"в", "9":"я", "@":"а", "$":"с"
-})
-
-# Broad Russian profanity roots. Review/edit this list for your community.
-PROFANITY_ROOTS = {
-    "бля", "бляд", "блять", "блят", "блядин",
-    "сука", "сук", "суч", "сучар",
-    "хуй", "хуя", "хуе", "хуи", "хуёв", "хуев", "хер",
-    "пизд", "пизд", "пиздец", "пизда",
-    "еб", "ёб", "йоб", "заеб", "заёб", "наеб", "наёб",
-    "уеб", "уёб", "выеб", "выёб", "въеб", "въёб",
-    "муд", "мудак", "мудил",
-    "гандон", "гондон", "манд", "залуп", "шлюх",
-    "дроч", "дрис", "перд", "срал", "срать", "говн",
-    "жоп", "сволоч", "сукин", "пидор", "пидар",
-    "даун", "чмо", "fuck", "shit", "bitch", "asshole",
-    # Insults / personal attacks
-    "лох", "лошар", "лузер", "неудачник", "дебил", "идиот", "туп",
-    "тупица", "дурак", "кретин", "придур", "ублюд", "урод", "мраз",
-    "гнид", "ссык", "ссик", "петух", "питух", "пидух", "чушпан",
-    "чурк", "хач", "чушка", "свин", "скот", "животн", "осел", "ослов",
-    "козел", "козлина", "псих", "шиз", "мусор", "помой", "ничтож",
-    "бесполез", "слабак", "сосун", "терпил", "подстил", "вырод",
-    "глуп", "безмозг", "мозгоклюй", "балбес", "болван", "фрик",
-    "лохмат", "позор", "засранец", "говнюк", "гад", "мерзав",
-    "ничтожество", "профурсет", "шалава", "проститут", "твар",
-    # Additional explicit vulgarity and insults (root-based)
-    "сос", "соси", "сосал", "сосала", "сосать",
-    "письк", "писюн", "писеч", "вагин", "хрен", "хренов",
-    "член", "залуп", "манда", "мандав", "мандах",
-    "сучка", "сукаб", "сучон", "сучье",
-    "пидр", "педик", "гомик", "гомосек",
-    "еблан", "ебан", "ебуч", "ебучк", "ебнут",
-    "хуесос", "хуйня", "хуйн", "хует", "хуйло",
-    "пиздюк", "пиздюл", "пиздобол", "пиздос",
-    "долбо", "долбоящ", "долбень",
-    "мудозвон", "мудила", "мудозвон",
-    "чмош", "чмыр", "чмошник",
-    "петушар", "петушок", "петушин",
-    "говноед", "говно", "говня",
-    "сран", "сру", "срун", "насрал",
-    "обосран", "обоссы", "засс",
-    "сволоч", "выродок", "душнил", "душный",
-    "мразот", "мразина", "гниль", "гнило",
-    "клоун", "циркач", "позорище",
-    "тупорыл", "тупоголов", "бездар", "ничтожн"
-}
-
-# A small allowlist helps avoid accidental matches in common innocent words.
-ALLOW_WORDS = {
-    "бляха", "блядь", # remove if you prefer strict filtering
-    "перед", "пердеть"  # edit as desired; these can be false-positive-prone
-}
+# Robust text normalization and configurable moderation vocabulary.
+HOMOGLYPHS = str.maketrans({'a':'а','c':'с','e':'е','o':'о','p':'р','x':'х','y':'у','k':'к','m':'м','t':'т','b':'в','h':'н','i':'и','j':'й','l':'л','v':'в','w':'ш','z':'з','0':'о','1':'и','3':'з','4':'ч','5':'с','6':'б','7':'т','8':'в','9':'я','@':'а','$':'с'})
+PROFANITY_ROOTS = set("""бля бляд блять блят сук суч хуй хуе хуя хуи хуёв хуев хую хер хрен пизд пиздец пизда еб ёб йоб заеб заёб наеб наёб уеб уёб выеб выёб въеб въёб вахуй вахуи вахуе вахую похуй похую похуи похуист похуйня ахуе охуе гандон гондон манд залуп шлюх дроч дрис перд срал срать говн жоп сволоч сукин пидор пидар даун чмо дебил идиот туп тупиц дурак кретин придур ублюд урод мраз гнид ссык петух питух пидух чушпан чурк хач чушка свин скот животн осел козел козлин псих шиз мусор помой ничтож бесполез слабак сосун терпил подстил вырод глуп безмозг балбес болван фрик позор засранец говнюк гад мерзав профурсет шалав проститут твар сос соси сосал сосала сосать письк писюн писеч вагин член манда мандав мандах сучка сучон сучье пидр педик гомик гомосек еблан ебан ебуч ебучк ебнут хуесос хуйн хует хуйло пиздюк пиздюл пиздобол пиздос долбо долбоящ долбень мудозвон мудила чмош чмыр петушар петушок петушин говноед говня сран сру срун насрал обосран обоссы засс мразот мразина гниль клоун циркач позорище тупорыл тупоголов бездар ничтожн лох лошар лузер неудачник тупица мразота гнида слабак соска шалава мерзкий козлина чмошник вахуйня хуйня нахуй нахуя нахер херня пидорас пидораст пидора пидорасина""".split())
+INSULT_ROOTS = set("""лох лошар лузер неудачник туп тупиц дурак кретин придур ублюд урод мраз гнид ссык петух питух пидух чушпан чурк хач чушка свин скот осел козел козлин псих шиз мусор помой ничтож бесполез слабак сосун терпил подстил вырод глуп безмозг балбес болван фрик позор засранец говнюк гад мерзав профурсет шалав проститут твар чмо дебил идиот пидор пидар даун гандон мудозвон мудила чмош чмыр петушар петушок говноед мразот мразина гниль клоун циркач позорище тупорыл тупоголов бездар ничтожн мразота гнида козлина чмошник душнил душный""".split())
+SHORT_FORMS={'лох','чмо','гад','хер','сука','fuck','shit','bitch'}
+ALLOW_WORDS={'бляха','перед','пердеть','пердёж','пердёжка'}
 
 def normalize(text: str) -> str:
-    text = text.lower().replace("ё", "е")
-    text = text.translate(LOOKALIKE_MAP).translate(DIGIT_MAP)
-    # Keep only letters; punctuation/spacing is removed to catch separators.
-    text = re.sub(r"[^а-я]", "", text)
-    # Collapse long repetitions: "суууука" -> "сука", "бляяяя" -> "бля"
-    text = re.sub(r"(.)\1{1,}", r"\1", text)
-    return text
+    text=text.casefold().replace('ё','е').translate(HOMOGLYPHS)
+    text=re.sub(r'[\u200b-\u200f\u2060\ufeff]','',text)
+    text=re.sub(r'([а-я])\1{2,}',r'\1\1',text)
+    return re.sub(r'[^а-я]+',' ',text).strip()
 
-def contains_swear(text: str) -> bool:
-    norm = normalize(text)
-    if not norm:
-        return False
+def _root_pattern(root: str) -> re.Pattern:
+    chars=[re.escape(ch) for ch in root]
+    return re.compile(r'(?<![а-я])'+r'[а-я]{0,1}'.join(chars)+r'(?![а-я])')
 
-    # Avoid broad accidental matches inside ordinary words/names.
-    # Check normalized tokens first; for longer profanity roots, allow inflected forms.
-    # Very short roots (2-3 letters) are intentionally excluded from substring matching.
-    tokens = re.findall(r"[а-я]+", text.lower().replace("ё", "е").translate(LOOKALIKE_MAP).translate(DIGIT_MAP))
-    normalized_tokens = [normalize(token) for token in tokens]
-    for root in PROFANITY_ROOTS:
-        root_norm = normalize(root)
-        if len(root_norm) <= 3:
-            if root_norm in normalized_tokens:
-                return True
-        elif any(token == root_norm or token.startswith(root_norm) for token in normalized_tokens):
-            return True
+_ROOT_PATTERNS=tuple((root,_root_pattern(root)) for root in PROFANITY_ROOTS if len(root)>=4)
+_INSULT_PATTERNS=tuple((root,_root_pattern(root)) for root in INSULT_ROOTS if len(root)>=4)
 
-    # Catch punctuation/spacing inserted inside a word, but only roots of 4+ letters.
-    compact = re.sub(r"[^а-я]", "", text.lower().replace("ё", "е").translate(LOOKALIKE_MAP).translate(DIGIT_MAP))
-    return any(len(normalize(root)) >= 4 and normalize(root) in compact for root in PROFANITY_ROOTS)
+def is_offensive(text: str) -> bool:
+    normalized=normalize(text)
+    if not normalized:return False
+    words=normalized.split()
+    if all(word in ALLOW_WORDS for word in words):return False
+    if any(word in SHORT_FORMS for word in words):return True
+    for word in words:
+        if any(word.startswith(root) for root in PROFANITY_ROOTS if len(root)>=4):return True
+        if any(root in word for root in ('хуй','хуе','хуя','хуи','хер','пизд','еба','ебу','ебн')):return True
+    if any(pattern.search(normalized) for _,pattern in _ROOT_PATTERNS):return True
+    compact=''.join(words)
+    return any(len(root)>=5 and root in compact for root in PROFANITY_ROOTS)
 
-db = sqlite3.connect(DB_PATH)
-db.execute("""
-CREATE TABLE IF NOT EXISTS violations (
-    chat_id INTEGER NOT NULL,
-    user_id INTEGER NOT NULL,
-    count INTEGER NOT NULL DEFAULT 0,
-    last_violation TEXT NOT NULL,
-    PRIMARY KEY (chat_id, user_id)
-)
-""")
-db.commit()
-db.execute("""
-CREATE TABLE IF NOT EXISTS chat_users (
- chat_id INTEGER NOT NULL, user_id INTEGER NOT NULL, username TEXT, full_name TEXT,
- PRIMARY KEY (chat_id, user_id)
-)
-""")
-db.commit()
+def is_directed_insult(text: str) -> bool:
+    normalized=normalize(text)
+    if not normalized:return False
+    if any(word in SHORT_FORMS for word in normalized.split()):return True
+    return any(pattern.search(normalized) for _,pattern in _INSULT_PATTERNS)
 
-def remember_user(chat_id: int, user):
-    if user:
-        db.execute("""INSERT INTO chat_users(chat_id,user_id,username,full_name) VALUES(?,?,?,?)
-        ON CONFLICT(chat_id,user_id) DO UPDATE SET username=excluded.username, full_name=excluded.full_name""",
-        (chat_id,user.id,(user.username or "").lower(),user.full_name or ""))
-        db.commit()
+# SQLite connection is used by this single asyncio event loop.
+db=sqlite3.connect(DB_PATH)
+db.execute('PRAGMA journal_mode=WAL')
+db.execute('''CREATE TABLE IF NOT EXISTS violations(chat_id INTEGER,user_id INTEGER,count INTEGER DEFAULT 0,last_violation TEXT,
+PRIMARY KEY(chat_id,user_id))''')
+db.execute('''CREATE TABLE IF NOT EXISTS chat_users(chat_id INTEGER,user_id INTEGER,username TEXT,full_name TEXT,
+PRIMARY KEY(chat_id,user_id))'''); db.commit()
 
-def find_user_by_username(chat_id: int, username: str):
-    return db.execute("SELECT user_id FROM chat_users WHERE chat_id=? AND username=?",
-        (chat_id, username.lower().lstrip("@"))).fetchone()
+def remember_user(chat_id,user):
+    db.execute('''INSERT INTO chat_users VALUES(?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET
+    username=excluded.username,full_name=excluded.full_name''',(chat_id,user.id,(user.username or '').lower(),user.full_name or '')); db.commit()
+def find_user(chat_id,username): return db.execute('SELECT user_id FROM chat_users WHERE chat_id=? AND username=?',(chat_id,username.lower().lstrip('@'))).fetchone()
+def count_violations(chat_id,user_id,now):
+    row=db.execute('SELECT count,last_violation FROM violations WHERE chat_id=? AND user_id=?',(chat_id,user_id)).fetchone()
+    if not row:return 0
+    try: last=datetime.fromisoformat(row[1])
+    except (ValueError,TypeError): return 0
+    if last.tzinfo is None:last=last.replace(tzinfo=timezone.utc)
+    return row[0] if now-last<=timedelta(days=RESET_AFTER_DAYS) else 0
+def save_count(chat_id,user_id,count,now):
+    db.execute('''INSERT INTO violations VALUES(?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET
+    count=excluded.count,last_violation=excluded.last_violation''',(chat_id,user_id,count,now.isoformat()));db.commit()
 
-bot = Bot(token=TOKEN)
-dp = Dispatcher()
+bot=Bot(TOKEN); dp=Dispatcher()
+async def is_admin(chat_id,user_id):
+    m=await bot.get_chat_member(chat_id,user_id); return m.status in ('administrator','creator')
+def mention(user):
+    if user.username:return '@'+user.username
+    name=(user.full_name or 'Пользователь').replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+    return f'<a href="tg://user?id={user.id}">{name}</a>'
 
-def current_count(chat_id: int, user_id: int, now: datetime) -> int:
-    row = db.execute(
-        "SELECT count, last_violation FROM violations WHERE chat_id=? AND user_id=?",
-        (chat_id, user_id)
-    ).fetchone()
-    if not row:
-        return 0
-    last = datetime.fromisoformat(row[1])
-    return row[0] if now - last <= timedelta(days=RESET_AFTER_DAYS) else 0
-
-def save_count(chat_id: int, user_id: int, count: int, now: datetime):
-    db.execute("""
-        INSERT INTO violations(chat_id,user_id,count,last_violation)
-        VALUES(?,?,?,?)
-        ON CONFLICT(chat_id,user_id)
-        DO UPDATE SET count=excluded.count,last_violation=excluded.last_violation
-    """, (chat_id, user_id, count, now.isoformat()))
-    db.commit()
-
-async def admin_check(chat_id: int, user_id: int) -> bool:
-    member = await bot.get_chat_member(chat_id, user_id)
-    return member.status in ("administrator", "creator")
-
-def mention(user) -> str:
-    # Prefer @username; fall back to a clickable name if no username exists.
-    if user.username:
-        return "@" + user.username
-    safe_name = (user.full_name or "Пользователь")
-    safe_name = (safe_name.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
-    return f'<a href="tg://user?id={user.id}">{safe_name}</a>'
-
-
-@dp.message(Command("warns"))
-async def warns(message: Message):
-    if not message.from_user:
-        return
-    now = datetime.now(timezone.utc)
-    count = current_count(message.chat.id, message.from_user.id, now)
-    await message.answer(
-        f"Нарушений за последние {RESET_AFTER_DAYS} дней: {count}. "
-        f"Первые {WARNING_LIMIT} — предупреждения; далее мут {MUTE_MINUTES} минут."
-    )
-
-@dp.message(Command("rules"))
-async def rules(message: Message):
-    await message.answer(
-        f"📜 Правила: первые {WARNING_LIMIT} нарушения за {RESET_AFTER_DAYS} дней — предупреждения; "
-        f"с {WARNING_LIMIT + 1}-го — мут на {MUTE_MINUTES} минут за каждое нарушение. "
-        "Счётчик сбрасывается после {RESET_AFTER_DAYS} дней без нарушений."
-    )
-
-@dp.message(Command("mute"))
-async def mute_command(message: Message):
-    if not message.from_user or not await admin_check(message.chat.id, message.from_user.id):
-        return
-    reply = message.reply_to_message
-    if not reply or not reply.from_user:
-        await message.answer("Ответь на сообщение пользователя: /mute или /mute 45")
-        return
-    args = (message.text or "").split()
+@dp.message(Command('warns'))
+async def warns(m:Message):
+    if m.from_user:
+        c=count_violations(m.chat.id,m.from_user.id,datetime.now(timezone.utc))
+        await m.answer(f'Нарушений за последние {RESET_AFTER_DAYS} дней: {c}. Первые {WARNING_LIMIT} — предупреждения; далее мут {MUTE_MINUTES} минут.')
+@dp.message(Command('rules'))
+async def rules(m:Message):
+    await m.answer(f'📜 Первые {WARNING_LIMIT} нарушения за {RESET_AFTER_DAYS} дней — предупреждения; с {WARNING_LIMIT+1}-го — мут {MUTE_MINUTES} минут. Счётчик сбрасывается после {RESET_AFTER_DAYS} дней без нарушений.')
+@dp.message(Command('mute'))
+async def mute(m:Message):
+    if not m.from_user: return
     try:
-        minutes = int(args[1]) if len(args) > 1 else MUTE_MINUTES
-        if not 1 <= minutes <= 10080:
-            raise ValueError
-    except ValueError:
-        await message.answer("Укажи число минут от 1 до 10080.")
-        return
-    target = reply.from_user
-    await bot.restrict_chat_member(
-        message.chat.id, target.id,
-        permissions=ChatPermissions(can_send_messages=False),
-        until_date=datetime.now(timezone.utc) + timedelta(minutes=minutes)
-    )
-    await message.answer(
-        f"🔇 {mention(target)} принудительно замьючен на {minutes} минут.",
-        parse_mode="HTML"
-    )
-
-@dp.message(Command("unmute"))
-async def unmute_command(message: Message):
-    if not message.from_user or not await admin_check(message.chat.id, message.from_user.id):
-        return
-    args = (message.text or "").split(maxsplit=1)
-    target = None
-    if len(args)>1 and args[1].strip().startswith("@"):
-        username=args[1].strip().split()[0].lstrip("@")
-        row=find_user_by_username(message.chat.id, username)
+        if not await is_admin(m.chat.id,m.from_user.id):return
+    except Exception: await m.answer('Не удалось проверить права администратора.');return
+    target=m.reply_to_message.from_user if m.reply_to_message and m.reply_to_message.from_user else None
+    if not target: await m.answer('Ответь на сообщение пользователя: /mute или /mute 45');return
+    args=(m.text or '').split()
+    try: minutes=int(args[1]) if len(args)>1 else MUTE_MINUTES; assert 1<=minutes<=10080
+    except (ValueError,AssertionError): await m.answer('Укажи число минут от 1 до 10080.');return
+    try:
+        await bot.restrict_chat_member(m.chat.id,target.id,permissions=ChatPermissions(can_send_messages=False),until_date=datetime.now(timezone.utc)+timedelta(minutes=minutes))
+        await m.answer(f'🔇 {mention(target)} замьючен на {minutes} минут.',parse_mode='HTML')
+    except Exception as e: logging.exception('mute failed'); await m.answer('Не удалось выдать мут. Проверь права бота (ограничение участников).')
+@dp.message(Command('unmute'))
+async def unmute(m:Message):
+    if not m.from_user:return
+    try:
+        if not await is_admin(m.chat.id,m.from_user.id):return
+    except Exception: await m.answer('Не удалось проверить права администратора.');return
+    target=None; args=(m.text or '').split(maxsplit=1)
+    if len(args)>1 and args[1].strip().startswith('@'):
+        row=find_user(m.chat.id,args[1].strip().split()[0])
         if row:
-            try:
-                target=(await bot.get_chat_member(message.chat.id,row[0])).user
-            except Exception:
-                target=None
-        if not target:
-            await message.answer(f"Не нашёл @{username}. Пользователь должен написать хотя бы раз в группе. "
-                               "Или ответь на его сообщение командой /unmute.")
-            return
-    elif message.reply_to_message and message.reply_to_message.from_user:
-        target=message.reply_to_message.from_user
-    else:
-        await message.answer("Используй /unmute @username или ответь на сообщение пользователя командой /unmute.")
-        return
+            try: target=(await bot.get_chat_member(m.chat.id,row[0])).user
+            except Exception: pass
+    elif m.reply_to_message and m.reply_to_message.from_user:target=m.reply_to_message.from_user
+    if not target: await m.answer('Используй /unmute @username или ответь на сообщение пользователя командой /unmute.');return
     try:
-        await bot.restrict_chat_member(message.chat.id,target.id,permissions=ChatPermissions(
-            can_send_messages=True,can_send_audios=True,can_send_documents=True,can_send_photos=True,
-            can_send_videos=True,can_send_video_notes=True,can_send_voice_notes=True,
-            can_send_polls=True,can_send_other_messages=True,can_add_web_page_previews=True))
-    except Exception:
-        await message.answer("Не удалось снять мут. Проверь права бота на ограничение участников.")
-        return
-    db.execute("DELETE FROM violations WHERE chat_id=? AND user_id=?",(message.chat.id,target.id)); db.commit()
-    await message.answer(f"🔊 {mention(target)} размьючен. Предупреждения сброшены.",parse_mode="HTML")
+        await bot.restrict_chat_member(m.chat.id,target.id,permissions=ChatPermissions(can_send_messages=True,can_send_audios=True,can_send_documents=True,can_send_photos=True,can_send_videos=True,can_send_video_notes=True,can_send_voice_notes=True,can_send_polls=True,can_send_other_messages=True,can_add_web_page_previews=True))
+        db.execute('DELETE FROM violations WHERE chat_id=? AND user_id=?',(m.chat.id,target.id));db.commit()
+        await m.answer(f'🔊 {mention(target)} размьючен. Предупреждения сброшены.',parse_mode='HTML')
+    except Exception: logging.exception('unmute failed'); await m.answer('Не удалось снять мут. Проверь права бота.')
 
-@dp.message(F.text)
-async def moderation(message: Message):
-    if not message.from_user or message.from_user.is_bot:
-        return
-    remember_user(message.chat.id, message.from_user)
+@dp.message(F.text | F.caption)
+async def moderation(m:Message):
+    u=m.from_user
+    if not u or u.is_bot:return
+    remember_user(m.chat.id,u)
     try:
-        if await admin_check(message.chat.id, message.from_user.id):
-            return
-    except Exception:
-        return
-
-    if not contains_swear(message.text):
-        return
-
+        if await is_admin(m.chat.id,u.id):return
+    except Exception: logging.exception('admin check failed'); return # fail closed
+    text=m.text or m.caption or ''
+    if not is_offensive(text):return
+    try: await m.delete()
+    except Exception: logging.exception('delete failed')
+    now=datetime.now(timezone.utc); cid,uid=m.chat.id,u.id
+    count=count_violations(cid,uid,now)+1;save_count(cid,uid,count,now); tag=mention(u)
+    if count<=WARNING_LIMIT:
+        msg=f'⚠️ {tag}, предупреждение {count}/{WARNING_LIMIT} за оскорбление/мат.'
+        msg+=f' До мута осталось предупреждений: {WARNING_LIMIT-count}.' if count<WARNING_LIMIT else f' Следующее нарушение — мут на {MUTE_MINUTES} минут.'
+        await m.answer(msg,parse_mode='HTML');return
     try:
-        await message.delete()
-    except Exception:
-        pass
-
-    now = datetime.now(timezone.utc)
-    chat_id, user_id = message.chat.id, message.from_user.id
-    count = current_count(chat_id, user_id, now) + 1
-    save_count(chat_id, user_id, count, now)
-    tag = mention(message.from_user)
-
-    if count <= WARNING_LIMIT:
-        left = WARNING_LIMIT - count
-        msg = (f"⚠️ {tag}, предупреждение {count}/{WARNING_LIMIT} за мат."
-               + (f" До мута осталось предупреждений: {left}." if left else
-                  " Следующее нарушение — мут на 15 минут."))
-        await message.answer(msg, parse_mode="HTML")
-        return
-
-    try:
-        until = now + timedelta(minutes=MUTE_MINUTES)
-        await bot.restrict_chat_member(
-            chat_id, user_id,
-            permissions=ChatPermissions(can_send_messages=False),
-            until_date=until
-        )
-        await message.answer(
-            f"🔇 {tag} получил мут на {MUTE_MINUTES} минут.\n"
-            f"Причина: мат. Нарушение №{count}.",
-            parse_mode="HTML"
-        )
-    except Exception:
-        await message.answer(
-            f"⚠️ {tag}: нарушение №{count}, но мут не удалось выдать. Проверьте права бота.",
-            parse_mode="HTML"
-        )
-
+        await bot.restrict_chat_member(cid,uid,permissions=ChatPermissions(can_send_messages=False),until_date=now+timedelta(minutes=MUTE_MINUTES))
+        await m.answer(f'🔇 {tag} получил мут на {MUTE_MINUTES} минут. Нарушение №{count}.',parse_mode='HTML')
+    except Exception: logging.exception('automatic mute failed'); await m.answer(f'⚠️ {tag}: нарушение №{count}, но мут не удалось выдать. Проверь права бота.',parse_mode='HTML')
 
 async def main():
-    print("Moderator running")
-    await dp.start_polling(bot)
-
-if __name__ == "__main__":
-    asyncio.run(main())
+    logging.info('Moderator started')
+    async with bot: await dp.start_polling(bot)
+if __name__=='__main__': asyncio.run(main())

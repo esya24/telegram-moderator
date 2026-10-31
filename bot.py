@@ -74,8 +74,23 @@ def contains_swear(text: str) -> bool:
     norm = normalize(text)
     if not norm:
         return False
-    # Search for roots in normalized string, including words with inserted punctuation.
-    return any(root in norm for root in PROFANITY_ROOTS)
+
+    # Avoid broad accidental matches inside ordinary words/names.
+    # Check normalized tokens first; for longer profanity roots, allow inflected forms.
+    # Very short roots (2-3 letters) are intentionally excluded from substring matching.
+    tokens = re.findall(r"[а-я]+", text.lower().replace("ё", "е").translate(LOOKALIKE_MAP).translate(DIGIT_MAP))
+    normalized_tokens = [normalize(token) for token in tokens]
+    for root in PROFANITY_ROOTS:
+        root_norm = normalize(root)
+        if len(root_norm) <= 3:
+            if root_norm in normalized_tokens:
+                return True
+        elif any(token == root_norm or token.startswith(root_norm) for token in normalized_tokens):
+            return True
+
+    # Catch punctuation/spacing inserted inside a word, but only roots of 4+ letters.
+    compact = re.sub(r"[^а-я]", "", text.lower().replace("ё", "е").translate(LOOKALIKE_MAP).translate(DIGIT_MAP))
+    return any(len(normalize(root)) >= 4 and normalize(root) in compact for root in PROFANITY_ROOTS)
 
 db = sqlite3.connect(DB_PATH)
 db.execute("""

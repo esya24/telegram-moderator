@@ -14,7 +14,7 @@ WARNING_LIMIT=int(os.getenv('WARNING_LIMIT','3')); MUTE_MINUTES=int(os.getenv('M
 HOMOGLYPHS = str.maketrans({'a':'а','c':'с','e':'е','o':'о','p':'р','x':'х','y':'у','k':'к','m':'м','t':'т','b':'в','h':'н','i':'и','j':'й','l':'л','v':'в','w':'ш','z':'з','0':'о','1':'и','3':'з','4':'ч','5':'с','6':'б','7':'т','8':'в','9':'я','@':'а','$':'с'})
 PROFANITY_ROOTS = set("""бля бляд блять блят сук суч хуй хуе хуя хуи хуёв хуев хую хер хрен пизд пиздец пизда еб ёб йоб заеб заёб наеб наёб уеб уёб выеб выёб въеб въёб вахуй вахуи вахуе вахую похуй похую похуи похуист похуйня ахуе охуе гандон гондон манд залуп шлюх дроч дрис перд срал срать говн жоп сволоч сукин пидор пидар даун чмо дебил идиот туп тупиц дурак кретин придур ублюд урод мраз гнид ссык петух питух пидух чушпан чурк хач чушка свин скот животн осел козел козлин псих шиз мусор помой ничтож бесполез слабак сосун терпил подстил вырод глуп безмозг балбес болван фрик позор засранец говнюк гад мерзав профурсет шалав проститут твар сос соси сосал сосала сосать письк писюн писеч вагин член манда мандав мандах сучка сучон сучье пидр педик гомик гомосек еблан ебан ебуч ебучк ебнут хуесос хуйн хует хуйло пиздюк пиздюл пиздобол пиздос долбо долбоящ долбень мудозвон мудила чмош чмыр петушар петушок петушин говноед говня сран сру срун насрал обосран обоссы засс мразот мразина гниль клоун циркач позорище тупорыл тупоголов бездар ничтожн лох лошар лузер неудачник тупица мразота гнида слабак соска шалава мерзкий козлина чмошник вахуйня хуйня нахуй нахуя нахер херня пидорас пидораст пидора пидорасина""".split())
 INSULT_ROOTS = set("""лох лошар лузер неудачник туп тупиц дурак кретин придур ублюд урод мраз гнид ссык петух питух пидух чушпан чурк хач чушка свин скот осел козел козлин псих шиз мусор помой ничтож бесполез слабак сосун терпил подстил вырод глуп безмозг балбес болван фрик позор засранец говнюк гад мерзав профурсет шалав проститут твар чмо дебил идиот пидор пидар даун гандон мудозвон мудила чмош чмыр петушар петушок говноед мразот мразина гниль клоун циркач позорище тупорыл тупоголов бездар ничтожн мразота гнида козлина чмошник душнил душный""".split())
-SHORT_FORMS={'лох','чмо','гад','хер','сука','fuck','shit','bitch'}
+SHORT_FORMS={'лох','чмо','гад','хер','сука','бля','blya','fuck','shit','bitch'}
 ALLOW_WORDS={'бляха','перед','пердеть','пердёж','пердёжка'}
 
 def normalize(text: str) -> str:
@@ -30,7 +30,32 @@ def _root_pattern(root: str) -> re.Pattern:
 _ROOT_PATTERNS=tuple((root,_root_pattern(root)) for root in PROFANITY_ROOTS if len(root)>=4)
 _INSULT_PATTERNS=tuple((root,_root_pattern(root)) for root in INSULT_ROOTS if len(root)>=4)
 
+
+# Latin transliterations and spaced/obfuscated variants commonly used in Russian chats.
+# Checked against the ORIGINAL text before Cyrillic normalization, because Latin
+# letters such as s/o/a are otherwise discarded or mapped as homoglyphs.
+_LATIN_BAD_WORDS = (
+    'blyat', 'bljat', 'bl9t', 'bl4t', 'blya', 'sosi', 'suka', 'suk',
+    'xuy', 'hui', 'xyi', 'huy', 'xui', 'pizda', 'pizd', 'pizdec',
+    'ebat', 'yebat', 'e6at', 'eblan', 'nahuy', 'nahui', 'na xuy',
+    'poxuy', 'pohuy', 'pohui', 'fuck', 'fck', 'shit', 'bitch',
+)
+
+def has_latin_profanity(text: str) -> bool:
+    # Remove punctuation/spacing between Latin letters, preserving words as a
+    # compact stream so forms like "s o s i" and "b.l.y.a.t" are caught.
+    latin = text.casefold().replace('ё', 'е')
+    compact = re.sub(r'[^a-z0-9]+', '', latin)
+    for word in _LATIN_BAD_WORDS:
+        key = re.sub(r'[^a-z0-9]+', '', word)
+        if key and key in compact:
+            return True
+    # Common leetspeak substitutions in Latin spellings.
+    compact = compact.translate(str.maketrans({'0':'o','1':'i','3':'e','4':'a','5':'s','6':'b','7':'t','@':'a','$':'s'}))
+    return any(re.sub(r'[^a-z0-9]+','',w) in compact for w in _LATIN_BAD_WORDS)
+
 def is_offensive(text: str) -> bool:
+    if has_latin_profanity(text):return True
     normalized=normalize(text)
     if not normalized:return False
     words=normalized.split()

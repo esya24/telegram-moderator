@@ -35,7 +35,7 @@ _INSULT_PATTERNS=tuple((root,_root_pattern(root)) for root in INSULT_ROOTS if le
 # Checked against the ORIGINAL text before Cyrillic normalization, because Latin
 # letters such as s/o/a are otherwise discarded or mapped as homoglyphs.
 _LATIN_BAD_WORDS = (
-    'blyat', 'bljat', 'bl9t', 'bl4t', 'blya', 'sosi', 'suka', 'suk',
+    'blyat', 'bljat', 'bl9t', 'bl4t', 'blya', 'sosi', 'otsosi', 'otsos', 'otsasy', 'suka', 'suk',
     'xuy', 'hui', 'xyi', 'huy', 'xui', 'pizda', 'pizd', 'pizdec',
     'ebat', 'yebat', 'e6at', 'eblan', 'nahuy', 'nahui', 'na xuy',
     'poxuy', 'pohuy', 'pohui', 'fuck', 'fck', 'shit', 'bitch',
@@ -59,6 +59,9 @@ def is_offensive(text: str) -> bool:
     normalized=normalize(text)
     if not normalized:return False
     words=normalized.split()
+    # Explicitly catch sexual imperative/derivative forms missed by root-prefix matching.
+    if re.search(r'(?<![а-я])(?:отсос\w*|отсоси\w*|отсасыва\w*|соси\w*|сосал\w*|сосала\w*|сосать\w*)(?![а-я])', normalized):
+        return True
     if all(word in ALLOW_WORDS for word in words):return False
     if any(word in SHORT_FORMS for word in words):return True
     for word in words:

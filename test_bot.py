@@ -97,6 +97,24 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         m=message(text='блять',chat_type='supergroup',cid=-100);m.from_user.is_bot=False;m.sender_chat=None;m.delete=AsyncMock()
         await app.moderation(m);m.delete.assert_not_awaited()
 
+    async def test_contextual_filter_is_used_by_group_handler(self):
+        for text,should_delete,reply in [
+            ('s0s1',True,False),
+            ('Что означает слово «sosi»?',False,False),
+            ('во дворе петух',False,True),
+            ('клоун',True,True),
+        ]:
+            with self.subTest(text=text):
+                app.db.execute('DELETE FROM violations');app.db.commit()
+                m=message(text=text,chat_type='supergroup',cid=-100)
+                m.from_user.is_bot=False;m.sender_chat=None;m.delete=AsyncMock()
+                m.reply_to_message=message(uid=99) if reply else None
+                with patch.object(app,'is_admin',AsyncMock(return_value=False)):
+                    await app.moderation(m)
+                self.assertEqual(m.delete.await_count,int(should_delete))
+                if should_delete:
+                    self.assertIn('оскорбление',m.answer.call_args.args[0])
+
     def test_filter_kept(self):
         self.assertTrue(app.is_offensive('блять'))
         self.assertFalse(app.is_offensive('Доброе утро'))

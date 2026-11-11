@@ -741,7 +741,8 @@ def install_owner(a):
         else:
             values = {name: '123' for name in fields(get(target))}
             preview = button(text(target, **values), callback_data='u:noop')
-        await show(m, f'<b>Стиль кнопок</b>\nТекущее значение: {e(ru('style',option(key)))}\nЦвет и вид отображения зависят от версии приложения Telegram.', rows, preview=preview)
+        current_style = e(ru('style', option(key)))
+        await show(m, f'<b>Стиль кнопок</b>\nТекущее значение: {current_style}\nЦвет и вид отображения зависят от версии приложения Telegram.', rows, preview=preview)
 
     async def consume(m):
         row = a.db.execute('SELECT kind,item,query,page FROM ui_drafts WHERE user_id=?', (m.from_user.id,)).fetchone()

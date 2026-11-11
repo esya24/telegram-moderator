@@ -70,13 +70,13 @@ def clear_draft(uid):
     db.commit()
 _panel_locks = {}
 
-async def render(m, text, reply_markup=None, **kwargs):
+async def render(m, text, reply_markup=None, new_panel=False, **kwargs):
     uid = m.chat.id
     if reply_markup is None:
         reply_markup = kb([[(ui_text('c20945ceeebc'), 'p:home:0')]])
     async with _panel_locks.setdefault(uid, asyncio.Lock()):
         row = db.execute('SELECT message_id FROM panels WHERE user_id=?', (uid,)).fetchone()
-        if row:
+        if row and not new_panel:
             try:
                 return await bot.edit_message_text(chat_id=uid, message_id=row[0], text=text, parse_mode='HTML', reply_markup=reply_markup, **kwargs)
             except TelegramBadRequest as exc:
@@ -90,10 +90,8 @@ async def render(m, text, reply_markup=None, **kwargs):
         db.commit()
 
 async def clean_input(m):
-    try:
-        await m.delete()
-    except Exception:
-        logging.debug('Could not remove private input')
+    # Keep commands and private messages. Only the bot's panel is edited.
+    return
 
 def remember_chat(chat):
     if chat.type in ('group', 'supergroup', 'channel'):
@@ -143,7 +141,7 @@ async def appeal_keyboard(cid):
     url = await create_start_link(bot, f'appeal_{cid}')
     return InlineKeyboardMarkup(inline_keyboard=[[ui_theme.button(text=ui_text('28729c6f31dd'), url=url)]])
 
-async def panel(m, uid, page=0):
+async def panel(m, uid, page=0, fresh=False):
     clear_draft(uid)
     rows = []
     for cid, title in db.execute('SELECT chat_id,title FROM chats ORDER BY title').fetchall():
@@ -162,8 +160,9 @@ async def panel(m, uid, page=0):
     if nav:
         rows.append(nav)
     rows += [[(ui_text('fec2b2edfb22'), 'p:connect:0', 'success')], [(ui_text('7e8aac83b310'), 'p:help:0'), (ui_text('808970003ae5'), 'p:home:0', 'primary')]]
+    rows.append([(ui_text('841fa27d7d8c'),'s:sync'),(ui_text('766d5301e754'),'s:choose')])
     if ui_theme.is_owner(uid):rows.append([('🎨 Оформление','u:home')])
-    await render(m, text, reply_markup=kb(rows))
+    await render(m, text, reply_markup=kb(rows),new_panel=fresh)
 
 async def show_chat(m, cid, note=''):
     w, minutes, enabled = config(cid)
@@ -233,7 +232,11 @@ async def start(m: Message):
         except Exception:
             await render(m, ui_text('d5042e53e2b8'))
         return
-    await panel(m, m.from_user.id)
+    await panel(m,m.from_user.id,fresh=True)
+    before=db.execute('SELECT chat_id,title FROM chats ORDER BY chat_id').fetchall()
+    await sync_chats(m.from_user.id)
+    if db.execute('SELECT chat_id,title FROM chats ORDER BY chat_id').fetchall()!=before:
+        await panel(m,m.from_user.id)
 
 @dp.message(Command('connect'), F.chat.type == 'private')
 async def connect(m: Message):
@@ -436,6 +439,19 @@ async def design(m:Message):
     await clean_input(m)
     await owner_design(m)
 
+@dp.message(F.chat.type=='private',F.chat_shared)
+async def picked_chat(m:Message):
+    await shared_chat(m)
+
+@dp.message(F.chat.type=='private',F.text=='Отменить выбор чата')
+async def cancel_picker(m:Message):
+    await cancel_chat_choice(m)
+
+@dp.message(Command('sync'),F.chat.type=='private')
+async def sync_command(m:Message):
+    await sync_chats(m.from_user.id)
+    await panel(m,m.from_user.id)
+
 @dp.message(F.chat.type == 'private')
 async def private_input(m: Message):
     if m.from_user and await owner_design_input(m):return
@@ -532,6 +548,8 @@ from moderator2 import install
 install(sys.modules[__name__])
 import ui_owner
 ui_owner.install(sys.modules[__name__])
+import chat_sync
+chat_sync.install(sys.modules[__name__])
 
 async def main():
     db.execute("UPDATE appeals SET status='pending' WHERE status='processing'")

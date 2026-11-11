@@ -1057,5 +1057,68 @@
     "locations": [
       "moderator2.py:229"
     ]
+  },
+  "841fa27d7d8c": {
+    "default": "Синхронизировать чаты",
+    "kind": "button",
+    "locations": [
+      "bot.py"
+    ]
+  },
+  "766d5301e754": {
+    "default": "Найти существующий чат",
+    "kind": "button",
+    "locations": [
+      "bot.py"
+    ]
+  },
+  "46b733c94565": {
+    "default": "Выбрать группу",
+    "kind": "button",
+    "locations": [
+      "chat_sync.py"
+    ]
+  },
+  "b48c31408974": {
+    "default": "Выбрать канал",
+    "kind": "button",
+    "locations": [
+      "chat_sync.py"
+    ]
+  },
+  "ae386efa179c": {
+    "default": "Выбери чат, где бот уже состоит, кнопкой под полем ввода. После выбора я проверю ваши права администратора.",
+    "kind": "text",
+    "locations": [
+      "chat_sync.py"
+    ]
+  },
+  "b6db8045441d": {
+    "default": "Выбор чата устарел. Открой «Найти существующий чат» снова.",
+    "kind": "text",
+    "locations": [
+      "chat_sync.py"
+    ]
+  },
+  "93c332681647": {
+    "default": "Чат подключён.",
+    "kind": "text",
+    "locations": [
+      "chat_sync.py"
+    ]
+  },
+  "f3d71269a3f3": {
+    "default": "Выбор чата отменён.",
+    "kind": "text",
+    "locations": [
+      "chat_sync.py"
+    ]
+  },
+  "05c2943f3f6b": {
+    "default": "Выбрать снова",
+    "kind": "button",
+    "locations": [
+      "chat_sync.py"
+    ]
   }
 }

@@ -1,3 +1,5 @@
+MODERATOR 2.2 — исправлены /start и синхронизация чатов. Сначала прочитайте FIX_2_2.md.
+
 MODERATOR 2.1 — оформление только владельцу.
 Прочитайте CUSTOMIZATION.md: настройте BOT_OWNER_ID на Bothost и откройте /design.
 

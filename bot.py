@@ -1,6 +1,7 @@
-from ui_theme import text as ui_text
+
+from interface import text as ui_text
 import asyncio, os, re, sqlite3, logging, uuid
-from html import escape
+from interface import escape
 from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -8,6 +9,13 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.filters import Command
 from aiogram.types import Message, ChatPermissions, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from language_filter import analyze, normalize, is_offensive, is_directed_insult, has_latin_profanity
+import interface as ui_theme
+from interface import EmojiFallback
+import sys
+from moderation import install_moderation, mode as moderation_mode
+from interface import install_owner, install_chat_sync
+
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
@@ -16,7 +24,6 @@ DB_PATH = os.getenv('DB_PATH', 'moderation.sqlite3')
 WARNING_LIMIT = int(os.getenv('WARNING_LIMIT', '3'))
 MUTE_MINUTES = int(os.getenv('MUTE_MINUTES', '15'))
 RESET_AFTER_DAYS = int(os.getenv('RESET_AFTER_DAYS', '7'))
-from language_filter import analyze, normalize, is_offensive, is_directed_insult, has_latin_profanity
 db = sqlite3.connect(DB_PATH)
 db.execute('PRAGMA journal_mode=WAL')
 db.execute('CREATE TABLE IF NOT EXISTS violations(chat_id INTEGER,user_id INTEGER,count INTEGER DEFAULT 0,last_violation TEXT,\nPRIMARY KEY(chat_id,user_id))')
@@ -25,7 +32,7 @@ db.commit()
 
 def remember_user(chat_id, user):
     db.execute('INSERT OR IGNORE INTO member_profiles VALUES(?,?,?)', (chat_id, user.id, datetime.now(timezone.utc).isoformat()))
-    db.execute('INSERT INTO chat_users VALUES(?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET\n    username=excluded.username,full_name=excluded.full_name', (chat_id, user.id, (user.username or '').lower(), user.full_name or ''))
+    db.execute('INSERT INTO chat_users VALUES(?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET\n    username=excluded.username,full_name=excluded.full_name WHERE chat_users.username IS NOT excluded.username OR chat_users.full_name IS NOT excluded.full_name', (chat_id, user.id, (user.username or '').lower(), user.full_name or ''))
     db.commit()
 
 def find_user(chat_id, username):
@@ -48,17 +55,16 @@ def save_count(chat_id, user_id, count, now):
     db.commit()
 db.executescript("\nCREATE TABLE IF NOT EXISTS chats(chat_id INTEGER PRIMARY KEY,title TEXT);\nCREATE TABLE IF NOT EXISTS settings(chat_id INTEGER PRIMARY KEY,warnings INTEGER,minutes INTEGER,enabled INTEGER DEFAULT 1);\nCREATE TABLE IF NOT EXISTS panels(user_id INTEGER PRIMARY KEY,message_id INTEGER);\nCREATE TABLE IF NOT EXISTS private_users(user_id INTEGER PRIMARY KEY);\nCREATE TABLE IF NOT EXISTS drafts(user_id INTEGER PRIMARY KEY,kind TEXT,chat_id INTEGER);\nCREATE TABLE IF NOT EXISTS appeals(id TEXT PRIMARY KEY,chat_id INTEGER,user_id INTEGER,name TEXT,reason TEXT,status TEXT DEFAULT 'pending');\nCREATE UNIQUE INDEX IF NOT EXISTS one_pending_appeal ON appeals(chat_id,user_id) WHERE status IN ('pending','processing');\nINSERT OR IGNORE INTO chats SELECT DISTINCT chat_id,CAST(chat_id AS TEXT) FROM chat_users WHERE chat_id<0;\n")
 db.commit()
-import ui_theme
 ui_theme.configure(db)
 bot = Bot(TOKEN,default=DefaultBotProperties(parse_mode='HTML'))
+bot.session.middleware(EmojiFallback())
 dp = Dispatcher(events_isolation=SimpleEventIsolation())
 
 def kb(rows):
 
     def button(item):
         text, data, *style = item
-        chosen=ui_theme.style(text,style[0] if style else None)
-        return InlineKeyboardButton(text=str(text),callback_data=data,**({'style':chosen} if chosen else {}))
+        return ui_theme.button(text,callback_data=data,**({'style':style[0]} if style else {}))
     return InlineKeyboardMarkup(inline_keyboard=[[button(item) for item in row] for row in ui_theme.layout(rows)])
 
 def back(cid):
@@ -95,7 +101,7 @@ async def clean_input(m):
 
 def remember_chat(chat):
     if chat.type in ('group', 'supergroup', 'channel'):
-        db.execute('INSERT INTO chats VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title', (chat.id, chat.title or str(chat.id)))
+        db.execute('INSERT INTO chats VALUES(?,?) ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title WHERE chats.title IS NOT excluded.title', (chat.id, chat.title or str(chat.id)))
         db.commit()
 
 def config(cid):
@@ -168,13 +174,8 @@ async def show_chat(m, cid, note=''):
     w, minutes, enabled = config(cid)
     title = db.execute('SELECT title FROM chats WHERE chat_id=?', (cid,)).fetchone()
     total = db.execute("SELECT COUNT(*) FROM appeals WHERE chat_id=? AND status='pending'", (cid,)).fetchone()[0]
-    await render(m, ui_text('7460d3ea71e0', v0=f'{escape(str(title[0] if title else cid))}', v1=f"{__import__('moderation_store').mode(db, cid)}", v2=f"{(ui_text('d607794aa65c') if enabled else ui_text('59e61d989724'))}", v3=f'{w}', v4=f'{minutes}', v5=f'{total}') + (f'\n\n{escape(note)}' if note else ''), reply_markup=kb([[(ui_text('cb6f91a5c8bf') if enabled else ui_text('64c59b4c5438'), f'p:toggle:{cid}', 'danger' if enabled else 'success')], [(ui_text('348ce92dffca'), f'p:warnings:{cid}'), (ui_text('653d48f72af6'), f'p:minutes:{cid}')], [(ui_text('9bc0685f61f5'), f'p:user:{cid}'), (ui_text('29adc9309c43'), f'p:list:{cid}')], [(ui_text('79b5ce112c02'), f'q:settings:{cid}'), (ui_text('d2b8c03ef0d8'), f'q:queue:{cid}:0')], [(ui_text('53d92a6a5b01'), f'q:history:{cid}:0')], [(ui_text('cd59f9bfc7a8', v0=f'{total}'), f'p:inbox:{cid}', 'primary')], [(ui_text('808970003ae5'), f'p:chat:{cid}'), (ui_text('23e67a4e5347'), 'p:home:0')]]))
+    await render(m, ui_text('7460d3ea71e0', v0=f'{escape(str(title[0] if title else cid))}', v1=f"{moderation_mode(db,cid)}", v2=f"{(ui_text('d607794aa65c') if enabled else ui_text('59e61d989724'))}", v3=f'{w}', v4=f'{minutes}', v5=f'{total}') + (f'\n\n{escape(note)}' if note else ''), reply_markup=kb([[(ui_text('cb6f91a5c8bf') if enabled else ui_text('64c59b4c5438'), f'p:toggle:{cid}', 'danger' if enabled else 'success')], [(ui_text('348ce92dffca'), f'p:warnings:{cid}'), (ui_text('653d48f72af6'), f'p:minutes:{cid}')], [(ui_text('9bc0685f61f5'), f'p:user:{cid}'), (ui_text('29adc9309c43'), f'p:list:{cid}')], [(ui_text('79b5ce112c02'), f'q:settings:{cid}'), (ui_text('d2b8c03ef0d8'), f'q:queue:{cid}:0')], [(ui_text('53d92a6a5b01'), f'q:history:{cid}:0')], [(ui_text('cd59f9bfc7a8', v0=f'{total}'), f'p:inbox:{cid}', 'primary')], [(ui_text('808970003ae5'), f'p:chat:{cid}'), (ui_text('23e67a4e5347'), 'p:home:0')]]))
 
-async def show_user(m, cid, uid, note=''):
-    member = await bot.get_chat_member(cid, uid)
-    count = count_violations(cid, uid, datetime.now(timezone.utc))
-    status = {'restricted': ui_text('3dbcfa050a2b'), 'member': ui_text('ccd79e755b49'), 'administrator': ui_text('b263ebf9e181'), 'creator': ui_text('2cccf1cf398d'), 'left': ui_text('030a684d5681'), 'kicked': ui_text('964466896474')}.get(member.status, member.status)
-    await render(m, ui_text('b6dfca22b845', v0=f'{escape(member.user.full_name)}', v1=f'{uid}', v2=f'{count}', v3=f'{escape(str(status))}') + (f'\n\n{escape(note)}' if note else ''), reply_markup=kb([[(ui_text('1886d473bfc1'), f'p:confirmmute:{cid}:{uid}', 'danger'), (ui_text('1e36aa6a752b'), f'p:unmute:{cid}:{uid}', 'success')], [(ui_text('9edd61654e61'), f'p:reset:{cid}:{uid}')], [(ui_text('c1ff8780621d'), f'p:chat:{cid}')]]))
 
 async def show_inbox(m, cid, page=0, note=''):
     rows = db.execute("SELECT id,name FROM appeals WHERE chat_id=? AND status='pending' ORDER BY rowid", (cid,)).fetchall()
@@ -368,8 +369,8 @@ async def decide(c: CallbackQuery):
             return
         db.execute('UPDATE appeals SET status=? WHERE id=?', (decision, aid))
         db.commit()
-        import moderation_store
-        moderation_store.audit(db, cid, uid, c.from_user.id, 'appeal_' + decision, details=aid)
+        import moderation
+        moderation.audit(db, cid, uid, c.from_user.id, 'appeal_' + decision, details=aid)
         result = ui_text('2f8bdd486f10') if decision == 'approve' else ui_text('74f75b558dcd')
         await show_inbox(c.message, cid, note=result)
         try:
@@ -540,16 +541,9 @@ async def private_input(m: Message):
         logging.exception('private input failed')
         await render(m, ui_text('88c664e96810'), reply_markup=back(cid) if cid else kb([[(ui_text('1c17b29ec9bd'), 'p:home:0')]]))
 
-@dp.message(F.chat.type.in_({'group', 'supergroup'}), F.text | F.caption)
-async def moderation(m: Message):
-    pass
-import sys
-from moderator2 import install
-install(sys.modules[__name__])
-import ui_owner
-ui_owner.install(sys.modules[__name__])
-import chat_sync
-chat_sync.install(sys.modules[__name__])
+install_moderation(sys.modules[__name__])
+install_owner(sys.modules[__name__])
+install_chat_sync(sys.modules[__name__])
 
 async def main():
     db.execute("UPDATE appeals SET status='pending' WHERE status='processing'")
@@ -557,8 +551,15 @@ async def main():
     db.execute("UPDATE decisions SET review_status='uncertain' WHERE review_status='processing'")
     db.commit()
     cleanup_task = asyncio.create_task(cleanup_moderation())
-    logging.info('Moderator 2.0 with private panel started')
-    async with bot:
-        await dp.start_polling(bot)
+    logging.info('Moderator 2.4 with private panel started')
+    try:
+        async with bot:
+            await dp.start_polling(bot)
+    finally:
+        cleanup_task.cancel()
+        from contextlib import suppress
+        with suppress(asyncio.CancelledError):
+            await cleanup_task
+        db.close()
 if __name__ == '__main__':
     asyncio.run(main())

@@ -12,38 +12,42 @@ import bot as app
 def message(uid=10,text='',chat_type='private',cid=None):
     return NS(from_user=NS(id=uid,full_name='User',username=None),
               chat=NS(id=cid if cid is not None else uid,type=chat_type,title='Test'),
-              text=text,answer=AsyncMock(),edit_reply_markup=AsyncMock())
+              text=text,answer=AsyncMock(),delete=AsyncMock(),message_id=70,edit_reply_markup=AsyncMock())
 def callback(data,uid=20,chat_type='private'):
     return NS(data=data,from_user=NS(id=uid),message=message(uid,chat_type=chat_type),answer=AsyncMock())
 
 class FlowTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        for table in ('chats','settings','drafts','appeals','violations','chat_users','private_users'):
+        for table in ('chats','settings','drafts','appeals','violations','chat_users','private_users','panels'):
             app.db.execute(f'DELETE FROM {table}')
         app.db.commit()
         app.remember_chat(NS(id=-100,title='Group',type='supergroup'))
         self.fake=NS(get_chat_member=AsyncMock(return_value=NS(status='restricted',can_send_messages=False,user=NS(id=10,is_bot=False,full_name='User'))),
                      get_chat=AsyncMock(return_value=NS(type='supergroup')),
                      get_chat_administrators=AsyncMock(return_value=[NS(user=NS(id=20,is_bot=False))]),
-                     send_message=AsyncMock(),restrict_chat_member=AsyncMock(),id=123456)
+                     send_message=AsyncMock(return_value=NS(message_id=70)),edit_message_text=AsyncMock(),restrict_chat_member=AsyncMock(),id=123456)
         self.p=patch.object(app,'bot',self.fake);self.p.start();self.addCleanup(self.p.stop)
 
     async def test_appeal_only_delivered_privately(self):
         m=message(text='Это ошибка')
         await app.start_appeal(m,-100)
         await app.private_input(m)
-        self.assertEqual(self.fake.send_message.call_args.args[0],20)
-        self.assertIn('Это ошибка',self.fake.send_message.call_args.args[1])
+        notice=[call for call in self.fake.send_message.call_args_list if call.args[0]==20]
+        self.assertEqual(len(notice),1)
+        self.assertIn('Открыть заявку',notice[0].kwargs['reply_markup'].inline_keyboard[0][0].text)
         self.assertEqual(app.db.execute('SELECT status FROM appeals').fetchone()[0],'pending')
         self.assertIsNone(app.db.execute('SELECT * FROM drafts').fetchone())
         await app.start_appeal(m,-100)
         self.assertIsNone(app.db.execute('SELECT * FROM drafts').fetchone())
 
     async def test_unreachable_admin_keeps_inbox(self):
-        self.fake.send_message.side_effect=RuntimeError('blocked')
+        async def send(uid,*args,**kwargs):
+            if uid==20:raise RuntimeError('blocked')
+            return NS(message_id=70)
+        self.fake.send_message.side_effect=send
         m=message(text='Причина');await app.start_appeal(m,-100);await app.private_input(m)
         self.assertEqual(app.db.execute('SELECT status FROM appeals').fetchone()[0],'pending')
-        self.assertIn('сохранена',m.answer.call_args.args[0])
+        self.assertIn('сохранена',self.fake.edit_message_text.call_args.kwargs['text'])
 
     async def test_cancel_removes_private_draft(self):
         m=message();await app.start_appeal(m,-100);await app.cancel(m)
@@ -114,6 +118,67 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(m.delete.await_count,int(should_delete))
                 if should_delete:
                     self.assertIn('оскорбление',m.answer.call_args.args[0])
+
+    async def test_navigation_and_input_reuse_one_message(self):
+        with patch.object(app,'allowed',AsyncMock(return_value=True)):
+            await app.panel(message(uid=20),20)
+            await app.panel_click(callback('p:chat:-100'))
+            await app.panel_click(callback('p:minutes:-100'))
+            await app.private_input(message(uid=20,text='42'))
+            await app.panel_click(callback('p:home:0'))
+        self.fake.send_message.assert_awaited_once()
+        self.assertEqual(self.fake.edit_message_text.await_count,4)
+        for call in self.fake.edit_message_text.call_args_list:
+            self.assertEqual(call.kwargs['message_id'],70)
+            self.assertEqual(call.kwargs['chat_id'],20)
+
+    async def test_duplicate_render_and_deleted_panel_recovery(self):
+        from aiogram.exceptions import TelegramBadRequest
+        from aiogram.methods import EditMessageText
+        await app.panel(message(uid=20),20)
+        method=EditMessageText(chat_id=20,message_id=70,text='Panel')
+        self.fake.edit_message_text.side_effect=TelegramBadRequest(method=method,message='message is not modified')
+        await app.panel(message(uid=20),20)
+        self.fake.send_message.assert_awaited_once()
+        self.fake.edit_message_text.side_effect=TelegramBadRequest(method=method,message='message to edit not found')
+        self.fake.send_message.return_value=NS(message_id=71)
+        await app.panel(message(uid=20),20)
+        self.assertEqual(self.fake.send_message.await_count,2)
+        self.assertEqual(app.db.execute('SELECT message_id FROM panels WHERE user_id=20').fetchone()[0],71)
+
+    async def test_network_error_does_not_create_duplicate_panel(self):
+        await app.panel(message(uid=20),20)
+        self.fake.edit_message_text.side_effect=RuntimeError('network')
+        with self.assertRaises(RuntimeError):await app.panel(message(uid=20),20)
+        self.fake.send_message.assert_awaited_once()
+
+    async def test_leaving_prompt_cancels_draft(self):
+        with patch.object(app,'allowed',AsyncMock(return_value=True)):
+            await app.panel_click(callback('p:minutes:-100'))
+            await app.panel_click(callback('p:chat:-100'))
+            await app.private_input(message(uid=20,text='99'))
+        self.assertEqual(app.config(-100)[1],app.MUTE_MINUTES)
+        self.assertIsNone(app.db.execute('SELECT * FROM drafts').fetchone())
+
+    async def test_inbox_pagination_and_escaped_content(self):
+        for n in range(8):
+            app.db.execute('INSERT INTO appeals VALUES(?,?,?,?,?,?)',(str(n),-100,n,'<User>','<script>','pending'))
+        app.db.commit()
+        await app.show_inbox(message(uid=20),-100)
+        buttons=self.fake.send_message.call_args.kwargs['reply_markup'].inline_keyboard
+        self.assertEqual(len([row for row in buttons if row[0].callback_data.startswith('p:appeal:')]),6)
+        await app.show_inbox(message(uid=20),-100,1)
+        buttons=self.fake.edit_message_text.call_args.kwargs['reply_markup'].inline_keyboard
+        self.assertEqual(len([row for row in buttons if row[0].callback_data.startswith('p:appeal:')]),2)
+        await app.show_appeal(message(uid=20),app.db.execute('SELECT * FROM appeals LIMIT 1').fetchone())
+        self.assertIn('&lt;script&gt;',self.fake.edit_message_text.call_args.kwargs['text'])
+
+    async def test_mute_requires_confirmation_screen(self):
+        with patch.object(app,'allowed',AsyncMock(return_value=True)):
+            await app.panel_click(callback('p:confirmmute:-100:10'))
+            self.fake.restrict_chat_member.assert_not_awaited()
+            await app.panel_click(callback('p:mute:-100:10'))
+        self.fake.restrict_chat_member.assert_awaited_once()
 
     def test_filter_kept(self):
         self.assertTrue(app.is_offensive('блять'))

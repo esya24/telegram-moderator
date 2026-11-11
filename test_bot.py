@@ -18,13 +18,13 @@ def callback(data,uid=20,chat_type='private'):
 
 class FlowTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        for table in ('chats','settings','drafts','appeals','violations','chat_users','private_users','panels'):
+        for table in ('decisions','audit_log','restrictions','member_profiles','manual_requests','ai_settings','chats','settings','drafts','appeals','violations','chat_users','private_users','panels'):
             app.db.execute(f'DELETE FROM {table}')
         app.db.commit()
         app.remember_chat(NS(id=-100,title='Group',type='supergroup'))
         self.fake=NS(get_chat_member=AsyncMock(return_value=NS(status='restricted',can_send_messages=False,user=NS(id=10,is_bot=False,full_name='User'))),
                      get_chat=AsyncMock(return_value=NS(type='supergroup')),
-                     get_chat_administrators=AsyncMock(return_value=[NS(user=NS(id=20,is_bot=False))]),
+                     delete_message=AsyncMock(),get_chat_administrators=AsyncMock(return_value=[NS(user=NS(id=20,is_bot=False))]),
                      send_message=AsyncMock(return_value=NS(message_id=70)),edit_message_text=AsyncMock(),restrict_chat_member=AsyncMock(),id=123456)
         self.p=patch.object(app,'bot',self.fake);self.p.start();self.addCleanup(self.p.stop)
 
@@ -102,6 +102,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         await app.moderation(m);m.delete.assert_not_awaited()
 
     async def test_contextual_filter_is_used_by_group_handler(self):
+        app.db.execute("INSERT INTO ai_settings VALUES(-100,'automatic')");app.db.commit()
         for text,should_delete,reply in [
             ('s0s1',True,False),
             ('Что означает слово «sosi»?',False,False),
@@ -109,7 +110,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
             ('клоун',True,True),
         ]:
             with self.subTest(text=text):
-                app.db.execute('DELETE FROM violations');app.db.commit()
+                app.db.execute('DELETE FROM violations');app.db.execute('DELETE FROM decisions');app.db.commit()
                 m=message(text=text,chat_type='supergroup',cid=-100)
                 m.from_user.is_bot=False;m.sender_chat=None;m.delete=AsyncMock()
                 m.reply_to_message=message(uid=99) if reply else None

@@ -672,4 +672,72 @@ class OptimizationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(app.db.total_changes,before)
         self.assertEqual(store.get(app.db,did)['category'],'spam')
 
+
+
+
+class LocalizationTests(unittest.IsolatedAsyncioTestCase):
+    setUp=FlowTests.setUp
+
+    async def engine_click(self,data):
+        handler=next(h.callback for h in app.dp.callback_query.handlers if h.callback.__qualname__.startswith('install_moderation.') and h.callback.__name__=='click')
+        with patch.object(app,'allowed',AsyncMock(return_value=True)):await handler(callback(data))
+
+    def visible(self):
+        call=(self.fake.edit_message_text.call_args or self.fake.send_message.call_args)
+        content=call.kwargs['text'] if 'text' in call.kwargs else call.args[1]
+        markup=call.kwargs.get('reply_markup')
+        labels=' '.join(b.text for row in markup.inline_keyboard for b in row) if markup else ''
+        return content+' '+labels
+
+    def assert_localized(self,value):
+        import re
+        self.assertIsNone(re.search(r'\b(?:observation|confirmation|automatic|pending|processing|accepted|rejected|uncertain|passed|warn|mute|ban|lift|profanity|personal_insult|original|primary|restricted|local-rules)\b',value))
+
+    async def test_mode_and_decision_screens_are_russian_without_changing_database_codes(self):
+        result=dict(category='personal_insult',confidence=.82,reason='Личное оскорбление',evidence='слово',action='review',model='local-rules-2.0')
+        did=store.record(app.db,-100,10,71,'слово',[{'user_id':11,'text':'Предыдущее сообщение'}],result,'confirmation')
+        await self.engine_click(f'q:decision:-100:{did}')
+        text=self.visible();self.assert_localized(text)
+        self.assertIn('Личное оскорбление',text);self.assertIn('Подтверждение администратором',text)
+        self.assertIn('Ожидает проверки',text);self.assertNotIn('user_id',text)
+        row=store.get(app.db,did)
+        self.assertEqual((row['category'],row['mode'],row['review_status']),('personal_insult','confirmation','pending'))
+        await self.engine_click('q:settings:-100');self.assert_localized(self.visible())
+
+    async def test_profile_restrictions_and_appeals_are_russian(self):
+        self.fake.get_chat_member.return_value=NS(status='restricted',until_date=app.datetime(2026,11,12,12,tzinfo=app.timezone.utc),user=NS(id=10,username='member',full_name='Участник',is_bot=False))
+        app.db.execute("INSERT INTO restrictions VALUES(-100,10,'mute','2026-11-12T12:00:00+00:00')")
+        app.db.execute("INSERT INTO appeals VALUES('ru',-100,10,'Участник','Причина','approve')");app.db.commit()
+        await app.show_user(message(uid=20),-100,10)
+        text=self.visible();self.assert_localized(text)
+        self.assertIn('Ограничен',text);self.assertIn('Обжалование принято',text);self.assertIn('12.11.2026 15:00 мск',text)
+
+    async def test_owner_options_and_manual_action_confirmation_are_russian(self):
+        with patch.dict(os.environ,{'BOT_OWNER_ID':'20'}):
+            handler=next(h.callback for h in app.dp.callback_query.handlers if h.callback.__qualname__.startswith('install_owner.') and h.callback.__name__=='click')
+            await handler(callback('u:home'))
+            self.assert_localized(self.visible());self.assertIn('Исходная раскладка',self.visible())
+            await handler(callback('u:styles:global'));self.assert_localized(self.visible())
+        await self.engine_click('q:askmute:-100:10')
+        self.assert_localized(self.visible());self.assertIn('Ограничение отправки',self.visible())
+
+    async def test_audit_and_queue_are_russian(self):
+        result=dict(category='profanity',confidence=None,reason='Мат',evidence='',action='warn',model='local-rules-2.0')
+        store.record(app.db,-100,10,71,'Текст',[],result,'observation')
+        store.audit(app.db,-100,10,20,'manual_warn')
+        await self.engine_click('q:member:-100:10:0')
+        self.assert_localized(self.visible());self.assertIn('Действие администратора',self.visible())
+
+    def test_error_and_context_do_not_expose_service_language(self):
+        self.assertIn('Чат не найден',theme.user_error(TelegramBadRequest(method=SendMessage(chat_id=20,text='x'),message='Bad Request: chat not found')))
+        self.assertNotIn('unexpected error',theme.user_error(RuntimeError('unexpected error')))
+        self.assertEqual(theme.ru('status','new_status'),'Неизвестное значение')
+        self.assertEqual(theme.ru_context('broken json'),'недоступен')
+        self.assertEqual(theme.ru_date('2026-11-12T12:00:00+00:00'),'12.11.2026 15:00 мск')
+
+    def test_long_translated_button_is_shortened_without_changing_callback(self):
+        result=theme.button('Очень длинная русская подпись '*5,callback_data='q:queue:-100:0')
+        self.assertLessEqual(len(result.text),64)
+        self.assertEqual(result.callback_data,'q:queue:-100:0')
+
 if __name__=='__main__':unittest.main()

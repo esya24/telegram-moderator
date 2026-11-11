@@ -1,5 +1,5 @@
 
-from interface import text as ui_text
+from interface import text as ui_text, ru, ru_date
 import asyncio, os, re, sqlite3, logging, uuid
 from interface import escape
 from datetime import datetime, timedelta, timezone
@@ -19,7 +19,7 @@ from interface import install_owner, install_chat_sync
 logging.basicConfig(level=logging.INFO)
 TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
-    raise RuntimeError('Set BOT_TOKEN environment variable')
+    raise RuntimeError('Укажите токен бота в переменной окружения BOT_TOKEN')
 DB_PATH = os.getenv('DB_PATH', 'moderation.sqlite3')
 WARNING_LIMIT = int(os.getenv('WARNING_LIMIT', '3'))
 MUTE_MINUTES = int(os.getenv('MUTE_MINUTES', '15'))
@@ -174,7 +174,7 @@ async def show_chat(m, cid, note=''):
     w, minutes, enabled = config(cid)
     title = db.execute('SELECT title FROM chats WHERE chat_id=?', (cid,)).fetchone()
     total = db.execute("SELECT COUNT(*) FROM appeals WHERE chat_id=? AND status='pending'", (cid,)).fetchone()[0]
-    await render(m, ui_text('7460d3ea71e0', v0=f'{escape(str(title[0] if title else cid))}', v1=f"{moderation_mode(db,cid)}", v2=f"{(ui_text('d607794aa65c') if enabled else ui_text('59e61d989724'))}", v3=f'{w}', v4=f'{minutes}', v5=f'{total}') + (f'\n\n{escape(note)}' if note else ''), reply_markup=kb([[(ui_text('cb6f91a5c8bf') if enabled else ui_text('64c59b4c5438'), f'p:toggle:{cid}', 'danger' if enabled else 'success')], [(ui_text('348ce92dffca'), f'p:warnings:{cid}'), (ui_text('653d48f72af6'), f'p:minutes:{cid}')], [(ui_text('9bc0685f61f5'), f'p:user:{cid}'), (ui_text('29adc9309c43'), f'p:list:{cid}')], [(ui_text('79b5ce112c02'), f'q:settings:{cid}'), (ui_text('d2b8c03ef0d8'), f'q:queue:{cid}:0')], [(ui_text('53d92a6a5b01'), f'q:history:{cid}:0')], [(ui_text('cd59f9bfc7a8', v0=f'{total}'), f'p:inbox:{cid}', 'primary')], [(ui_text('808970003ae5'), f'p:chat:{cid}'), (ui_text('23e67a4e5347'), 'p:home:0')]]))
+    await render(m, ui_text('7460d3ea71e0', v0=f'{escape(str(title[0] if title else cid))}', v1=f"{ru('mode',moderation_mode(db,cid))}", v2=f"{(ui_text('d607794aa65c') if enabled else ui_text('59e61d989724'))}", v3=f'{w}', v4=f'{minutes}', v5=f'{total}') + (f'\n\n{escape(note)}' if note else ''), reply_markup=kb([[(ui_text('cb6f91a5c8bf') if enabled else ui_text('64c59b4c5438'), f'p:toggle:{cid}', 'danger' if enabled else 'success')], [(ui_text('348ce92dffca'), f'p:warnings:{cid}'), (ui_text('653d48f72af6'), f'p:minutes:{cid}')], [(ui_text('9bc0685f61f5'), f'p:user:{cid}'), (ui_text('29adc9309c43'), f'p:list:{cid}')], [(ui_text('79b5ce112c02'), f'q:settings:{cid}'), (ui_text('d2b8c03ef0d8'), f'q:queue:{cid}:0')], [(ui_text('53d92a6a5b01'), f'q:history:{cid}:0')], [(ui_text('cd59f9bfc7a8', v0=f'{total}'), f'p:inbox:{cid}', 'primary')], [(ui_text('808970003ae5'), f'p:chat:{cid}'), (ui_text('23e67a4e5347'), 'p:home:0')]]))
 
 
 async def show_inbox(m, cid, page=0, note=''):
@@ -334,7 +334,7 @@ async def panel_click(c: CallbackQuery):
                 db.commit()
             await show_user(c.message, cid, uid, {'mute': ui_text('44a9385dcf96'), 'unmute': ui_text('d0b3378cfcaf'), 'reset': ui_text('407755fe0f23')}.get(action, ''))
     except Exception:
-        logging.exception('panel action failed')
+        logging.exception('Не удалось выполнить действие панели')
         await render(c.message, ui_text('73d87f95e939'), reply_markup=kb([[(ui_text('c20945ceeebc'), 'p:home:0')]]))
 
 @dp.callback_query(F.data.startswith('a:'))
@@ -376,9 +376,9 @@ async def decide(c: CallbackQuery):
         try:
             await bot.send_message(uid, result)
         except Exception:
-            logging.info('User cannot receive appeal result')
+            logging.info('Не удалось доставить пользователю результат обжалования')
     except Exception:
-        logging.exception('appeal decision failed')
+        logging.exception('Не удалось обработать решение по обжалованию')
 
 @dp.callback_query(F.data.startswith('appeal_start:'))
 async def legacy_appeal(c: CallbackQuery):
@@ -431,7 +431,7 @@ async def group_action(m: Message):
 @dp.message(Command('id'), F.chat.type=='private')
 async def own_id(m:Message):
     await clean_input(m)
-    await render(m,f'Твой Telegram ID: <code>{m.from_user.id}</code>')
+    await render(m,f'Твой идентификатор Telegram: <code>{m.from_user.id}</code>')
 
 @dp.message(Command('design'), F.chat.type=='private')
 async def design(m:Message):
@@ -504,7 +504,7 @@ async def private_input(m: Message):
             try:
                 admins = await bot.get_chat_administrators(cid)
             except Exception:
-                logging.exception('Cannot enumerate appeal recipients')
+                logging.exception('Не удалось получить список получателей обжалования')
                 admins = []
             for admin in admins:
                 if admin.user.is_bot:
@@ -513,7 +513,7 @@ async def private_input(m: Message):
                     await bot.send_message(admin.user.id, ui_text('1cc8c75acc70'), reply_markup=kb([[(ui_text('86e1ebfed67d'), f'p:appeal:{cid}:{aid}', 'primary')]]))
                     delivered += 1
                 except Exception:
-                    logging.info('Admin %s unavailable in private chat', admin.user.id)
+                    logging.info('Администратор %s недоступен в личных сообщениях', admin.user.id)
             await render(m, ui_text('222ec2fbdc5b') if delivered else ui_text('e190f23ee535'))
             return
         if kind == 'user':
@@ -538,7 +538,7 @@ async def private_input(m: Message):
     except ValueError:
         await render(m, ui_text('5e652fc85ecb'), reply_markup=back(cid) if cid else kb([[(ui_text('1c17b29ec9bd'), 'p:home:0')]]))
     except Exception:
-        logging.exception('private input failed')
+        logging.exception('Не удалось обработать сообщение в личной переписке')
         await render(m, ui_text('88c664e96810'), reply_markup=back(cid) if cid else kb([[(ui_text('1c17b29ec9bd'), 'p:home:0')]]))
 
 install_moderation(sys.modules[__name__])
@@ -551,7 +551,7 @@ async def main():
     db.execute("UPDATE decisions SET review_status='uncertain' WHERE review_status='processing'")
     db.commit()
     cleanup_task = asyncio.create_task(cleanup_moderation())
-    logging.info('Moderator 2.4 with private panel started')
+    logging.info('Модератор 2.5 запущен с панелью в личных сообщениях')
     try:
         async with bot:
             await dp.start_polling(bot)

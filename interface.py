@@ -1,6 +1,8 @@
 """Owner appearance, custom emoji and chat discovery."""
 
 import os, re, unicodedata
+import json
+from datetime import datetime, timezone, timedelta
 from collections import OrderedDict
 from html import escape as _html_escape, unescape
 from aiogram.exceptions import TelegramBadRequest
@@ -15,6 +17,81 @@ import asyncio, secrets
 from aiogram import BaseMiddleware
 from aiogram.types import KeyboardButton, KeyboardButtonRequestChat, ReplyKeyboardMarkup, ReplyKeyboardRemove
 
+
+
+# Переводим отображаемые значения, сохраняя коды базы и Telegram API.
+RUSSIAN = {
+    'mode': {'observation':'Наблюдение','confirmation':'Подтверждение администратором','automatic':'Автоматическая модерация'},
+    'status': {'pending':'Ожидает проверки','processing':'Обрабатывается','accepted':'Подтверждено','rejected':'Отклонено',
+        'automatic':'Применено автоматически','uncertain':'Нужно проверить результат','passed':'Нарушений не найдено',
+        'approve':'Обжалование принято','reject':'Обжалование отклонено'},
+    'action': {'none':'Без наказания','pass':'Пропустить','observe':'Наблюдать','review':'Проверить вручную',
+        'warn':'Предупреждение','mute':'Ограничение отправки сообщений','ban':'Блокировка','lift':'Снятие ограничения',
+        'unmute':'Снятие ограничения','reset':'Сброс предупреждений'},
+    'category': {'none':'Нет нарушения','clean':'Нет нарушения','discussion':'Обсуждение или цитата',
+        'profanity':'Нецензурная лексика','personal_insult':'Личное оскорбление','insult':'Личное оскорбление',
+        'threat':'Угроза','spam':'Спам','other':'Другое нарушение'},
+    'member': {'creator':'Владелец чата','administrator':'Администратор','member':'Участник',
+        'restricted':'Ограничен','kicked':'Заблокирован','left':'Покинул чат'},
+    'style': {'original':'Исходный / наследовать','neutral':'Обычный','primary':'Основной','success':'Успех','danger':'Опасность'},
+    'columns': {'original':'Исходная раскладка','1':'По одной','2':'По две','3':'По три'},
+    'audit': {'mode':'Изменён режим модерации','warn':'Выдано предупреждение','mute':'Выдано ограничение',
+        'ban':'Участник заблокирован','lift':'Ограничение снято','accepted':'Решение подтверждено',
+        'rejected':'Решение отклонено','uncertain':'Требуется проверка результата',
+        'appeal_approve':'Обжалование принято','appeal_reject':'Обжалование отклонено'},
+    'model': {'local-rules-2.0':'Локальные правила','local-fallback-2.0':'Локальные правила (ИИ недоступен)'}
+}
+
+def ru(kind,value):
+    value=str(value)
+    if kind=='audit' and value.startswith('manual_'):
+        return 'Действие администратора: '+ru('action',value[7:]).lower()
+    if kind=='model':return RUSSIAN[kind].get(value,'Внешняя модель · '+value)
+    return RUSSIAN.get(kind,{}).get(value,{'category':'Другое нарушение','audit':'Другое действие'}.get(kind,'Неизвестное значение'))
+
+def ru_date(value):
+    if not value:return 'не указано'
+    try:
+        stamp=value if isinstance(value,datetime) else datetime.fromisoformat(str(value))
+        if stamp.tzinfo is None:stamp=stamp.replace(tzinfo=timezone.utc)
+        return stamp.astimezone(timezone(timedelta(hours=3))).strftime('%d.%m.%Y %H:%M мск')
+    except (ValueError,TypeError):return 'не указано'
+
+def ru_restriction(row):
+    if not row:return 'нет'
+    return ru('action',row[0])+(' · до '+ru_date(row[1]) if row[1] else ' · бессрочно')
+
+def ru_context(value):
+    if not value:return 'не сохранён'
+    try:
+        items=json.loads(value)
+        if not isinstance(items,list):return 'недоступен'
+        lines=[]
+        for item in items:
+            if not isinstance(item,dict):continue
+            if 'reply' in item:lines.append('Ответ на сообщение: '+str(item['reply']))
+            elif 'text' in item:lines.append('Участник '+str(item.get('user_id','—'))+': '+str(item['text']))
+        return '\n'.join(lines) or 'не сохранён'
+    except (ValueError,TypeError):return 'недоступен'
+
+def user_error(exc):
+    """Не показываем пользователю необработанные ошибки сторонних библиотек."""
+    value=str(exc)
+    if isinstance(exc,ValueError) and re.search('[А-Яа-яЁё]',value):return value
+    lowered=value.lower()
+    for fragment,message in (
+        ('not enough rights','Боту не хватает прав администратора.'),
+        ('chat not found','Чат не найден или недоступен боту.'),
+        ('user not found','Участник не найден.'),
+        ('user not a participant','Участник не состоит в чате.'),
+        ("can't parse entities",'Проверьте разметку текста.'),
+        ('message is too long','Текст слишком длинный. Сократите его.'),
+        ('button_data_invalid','Не удалось обработать кнопку. Откройте панель заново.'),
+        ('forbidden','Боту запрещён доступ. Проверьте его права.'),
+        ('retry after','Слишком много запросов. Повторите действие немного позже.')
+    ):
+        if fragment in lowered:return message
+    return 'Проверьте ввод, права бота и доступность Telegram, затем повторите действие.'
 
 ALTERNATIVES = OrderedDict()
 TAG = re.compile('<tg-emoji\\s+emoji-id=[\\"\\x27]([1-9][0-9]{0,19})[\\"\\x27]\\s*>([^<>]+)</tg-emoji>')
@@ -33,7 +110,7 @@ def from_message(message):
         if entity.type != 'custom_emoji':
             continue
         if not valid_id(entity.custom_emoji_id):
-            raise ValueError('Некорректный ID премиум-эмодзи.')
+            raise ValueError('Некорректный идентификатор премиум-эмодзи.')
         start, end = (entity.offset * 2, (entity.offset + entity.length) * 2)
         if start < 0 or end > len(raw) or start >= end:
             raise ValueError('Повреждённые границы эмодзи.')
@@ -124,7 +201,7 @@ def validate_tags(value):
     for match in matches:
         alt = unescape(match[2])
         if not valid_id(match[1]) or not any((unicodedata.category(c) == 'So' or c == '⃣' for c in alt)):
-            raise ValueError('Проверьте ID и обычный эмодзи внутри tg-emoji.')
+            raise ValueError('Проверьте идентификатор и обычный эмодзи внутри tg-emoji.')
         if '{' in alt or '}' in alt or len(alt) > 32:
             raise ValueError('Альтернатива премиум-эмодзи должна быть обычным эмодзи.')
 
@@ -175,7 +252,7 @@ CATALOG = {'c1ff8780621d': {'default': '‹ Назад', 'kind': 'button'},
  'b6dfca22b845': {'default': '<b>Участник</b>\n'
                              '\n'
                              '{v0}\n'
-                             'ID  ·  <code>{v1}</code>\n'
+                             'идентификатор  ·  <code>{v1}</code>\n'
                              'Предупреждения  ·  {v2}\n'
                              'Статус  ·  {v3}',
                   'kind': 'text'},
@@ -216,15 +293,16 @@ CATALOG = {'c1ff8780621d': {'default': '‹ Назад', 'kind': 'button'},
  'b3ff4a18f846': {'default': '‹ Главное меню', 'kind': 'button'},
  '711486dc5d9a': {'default': '<b>Подключить чат</b>\n'
                              '\n'
-                             'Отправьте ID группы обсуждений, например <code>-1001234567890</code>. Вы и бот '
-                             'должны быть её администраторами.',
+                             'Отправьте идентификатор группы обсуждений, например '
+                             '<code>-1001234567890</code>. Вы и бот должны быть её администраторами.',
                   'kind': 'text'},
  '4b11439aefa6': {'default': 'Нет прав администратора.', 'kind': 'text'},
  'bd6d444a9285': {'default': 'Введи лимит предупреждений от 1 до 100.', 'kind': 'text'},
  '6cf83ed60c27': {'default': 'Введи длительность мута от 1 до 10080 минут.', 'kind': 'text'},
- 'f3e684a99571': {'default': 'Введи ID участника или @username (бот должен ранее видеть его сообщения).',
+ 'f3e684a99571': {'default': 'Введи числовой идентификатор участника или имя пользователя с @ (бот должен ранее видеть '
+                             'его сообщения).',
                   'kind': 'text'},
- 'e88d922a436a': {'default': 'ID {v0} · {v1}', 'kind': 'button'},
+ 'e88d922a436a': {'default': 'идентификатор {v0} · {v1}', 'kind': 'button'},
  '0889085cbdb8': {'default': '<b>Нарушения</b>\n\n', 'kind': 'text'},
  '77211aeb983d': {'default': 'Последние 30 участников. Выберите карточку.', 'kind': 'text'},
  '07a82705517b': {'default': 'Активных предупреждений нет.', 'kind': 'text'},
@@ -235,7 +313,7 @@ CATALOG = {'c1ff8780621d': {'default': '‹ Назад', 'kind': 'button'},
  '44a9385dcf96': {'default': 'Мут выдан.', 'kind': 'text'},
  'd0b3378cfcaf': {'default': 'Мут снят, предупреждения сброшены.', 'kind': 'text'},
  '407755fe0f23': {'default': 'Предупреждения сброшены.', 'kind': 'text'},
- '73d87f95e939': {'default': 'Не удалось выполнить действие. Проверьте права бота и ID участника.',
+ '73d87f95e939': {'default': 'Не удалось выполнить действие. Проверьте права бота и идентификатор участника.',
                   'kind': 'text'},
  '90140e43e069': {'default': 'Решения доступны только в ЛС.', 'kind': 'text'},
  '6e85116e3848': {'default': 'Заявка уже обработана или недействительна.', 'kind': 'text'},
@@ -254,7 +332,7 @@ CATALOG = {'c1ff8780621d': {'default': '‹ Назад', 'kind': 'button'},
                   'kind': 'text'},
  '4266f1fc07d3': {'default': 'Ответь на сообщение участника этой командой. Управление в ЛС: /panel',
                   'kind': 'text'},
- '75fe50ac9385': {'default': '🔇 Участник ID {v0} получил мут на {v1} мин.', 'kind': 'text'},
+ '75fe50ac9385': {'default': '🔇 Участник идентификатор {v0} получил мут на {v1} мин.', 'kind': 'text'},
  '68e5811e6d09': {'default': 'Не удалось выполнить действие. Проверь участника, число минут (1–10080) и '
                              'права бота.',
                   'kind': 'text'},
@@ -281,7 +359,7 @@ CATALOG = {'c1ff8780621d': {'default': '‹ Назад', 'kind': 'button'},
  '3adae8ec04f0': {'default': 'Без имени', 'kind': 'text'},
  '99f53adc19e3': {'default': 'до обновления, дата неизвестна', 'kind': 'text'},
  'd5330ae677c2': {'default': '<b>Участник · {v0}</b>\n'
-                             'ID · <code>{v1}</code>\n'
+                             'идентификатор · <code>{v1}</code>\n'
                              '@{v2}\n'
                              'Первое появление · {v3}\n'
                              'Текущие предупреждения · {v4}\n'
@@ -350,12 +428,13 @@ CATALOG = {'c1ff8780621d': {'default': '‹ Назад', 'kind': 'button'},
                   'kind': 'text'},
  '831245d46a32': {'default': 'Включить', 'kind': 'button'},
  'bee1f7f9cdbd': {'default': '<b>Подтвердить санкцию?</b>\n'
-                             'Участник {v0}. Предупреждение или мут по лимиту; рекомендация mute означает '
-                             'мут. Сообщение будет удалено.',
+                             'Участник {v0}. Предупреждение или мут по лимиту; рекомендация «ограничение '
+                             'отправки» означает ограничение отправки сообщений. Сообщение будет удалено.',
                   'kind': 'text'},
  '6f7b255f079f': {'default': 'Применить', 'kind': 'button'},
  '334be61abf66': {'default': 'Уже обработано.', 'kind': 'text'},
- '0f95f1550f86': {'default': 'При uncertain проверьте Telegram: повтор автоматически запрещён.',
+ '0f95f1550f86': {'default': 'Если результат требует проверки, проверьте статус участника в Telegram. '
+                             'Автоматический повтор запрещён.',
                   'kind': 'text'},
  '3a8adb1ea710': {'default': '<b>Подтвердить действие {v0}?</b>\nУчастник {v1}', 'kind': 'text'},
  '24fae79d5eaa': {'default': 'Действие выполнено.', 'kind': 'text'},
@@ -510,10 +589,10 @@ def text(key, **values):
     try:
         result = get(key).format_map(values)
         if CATALOG[key]['kind'] == 'button' and (not plain(result).strip() or len(plain(result)) > 64):
-            raise ValueError('button too long')
+            raise ValueError('Слишком длинное название кнопки')
         return Label(result, key)
     except (KeyError, ValueError, IndexError):
-        logging.warning('Invalid UI customization for %s; using default', key)
+        logging.warning('Некорректное оформление %s; использован исходный текст', key)
         return Label(default.format_map(values), key)
 
 def option(key, default='original'):
@@ -585,7 +664,7 @@ def button(text, **kwargs):
     visible, icon = button_parts(text)
     if icon:
         kwargs['icon_custom_emoji_id'] = icon
-    return InlineKeyboardButton(text=visible, **kwargs)
+    return InlineKeyboardButton(text=visible if len(visible)<=64 else visible[:63]+'…', **kwargs)
 
 def keyboard_button(text, **kwargs):
     from aiogram.types import KeyboardButton
@@ -595,7 +674,7 @@ def keyboard_button(text, **kwargs):
     chosen = style(text, kwargs.pop('style', None))
     if chosen:
         kwargs['style'] = chosen
-    return KeyboardButton(text=visible, **kwargs)
+    return KeyboardButton(text=visible if len(visible)<=64 else visible[:63]+'…', **kwargs)
 
 def escape(value, quote=True):
     """Only catalog-owned Labels contain trusted HTML; member data stays escaped."""
@@ -619,7 +698,7 @@ def install_owner(a):
     async def home(m):
         a.clear_draft(m.chat.id)
         changed = a.db.execute('SELECT COUNT(*) FROM ui_overrides').fetchone()[0]
-        await show(m, f"<b>Оформление · Только создатель</b>\n\nИзменено текстов: {changed} / {len(CATALOG)}\nОбщий стиль кнопок: {e(option('style'))}\nКнопок в ряду: {e(option('columns'))}\n\nИзменения общие для всех пользователей бота. Права и действия кнопок сохраняются. Выберите элемент, измените текст, проверьте предпросмотр и сохраните.\nКоманда /design всегда открывает этот редактор.", [[('Тексты и сообщения', 'u:list:text:0'), ('Кнопки', 'u:list:button:0')], [('Поиск элемента', 'u:search')], [('Общий стиль кнопок', 'u:styles:global')], [('Раскладка кнопок', 'u:layout')], [('Сбросить оформление', 'u:resetask')], [('‹ Главное меню', 'p:home:0')]])
+        await show(m, f"<b>Оформление · Только создатель</b>\n\nИзменено текстов: {changed} / {len(CATALOG)}\nОбщий стиль кнопок: {e(ru('style',option('style')))}\nКнопок в ряду: {e(ru('columns',option('columns')))}\n\nИзменения общие для всех пользователей бота. Права и действия кнопок сохраняются. Выберите элемент, измените текст, проверьте предпросмотр и сохраните.\nКоманда /design всегда открывает этот редактор.", [[('Тексты и сообщения', 'u:list:text:0'), ('Кнопки', 'u:list:button:0')], [('Поиск элемента', 'u:search')], [('Общий стиль кнопок', 'u:styles:global')], [('Раскладка кнопок', 'u:layout')], [('Сбросить оформление', 'u:resetask')], [('‹ Главное меню', 'p:home:0')]])
 
     async def listing(m, kind, page=0, query=''):
         query = query.casefold()
@@ -662,7 +741,7 @@ def install_owner(a):
         else:
             values = {name: '123' for name in fields(get(target))}
             preview = button(text(target, **values), callback_data='u:noop')
-        await show(m, f'<b>Стиль кнопок</b>\nТекущее значение: {e(option(key))}\nЦвет и вид отображения зависят от версии приложения Telegram.', rows, preview=preview)
+        await show(m, f'<b>Стиль кнопок</b>\nТекущее значение: {e(ru('style',option(key)))}\nЦвет и вид отображения зависят от версии приложения Telegram.', rows, preview=preview)
 
     async def consume(m):
         row = a.db.execute('SELECT kind,item,query,page FROM ui_drafts WHERE user_id=?', (m.from_user.id,)).fetchone()
@@ -705,7 +784,7 @@ def install_owner(a):
         except (ValueError, KeyError) as exc:
             a.db.execute("UPDATE ui_drafts SET kind='edit' WHERE user_id=?", (m.from_user.id,))
             a.db.commit()
-            await show(m, '<b>Проверьте оформление</b>\n' + e(str(exc)) + '\nОтправьте исправленный текст.', [[('Отмена', f'u:cancel:{key}')]])
+            await show(m, '<b>Проверьте оформление</b>\n' + e(user_error(exc)) + '\nОтправьте исправленный текст.', [[('Отмена', f'u:cancel:{key}')]])
         return True
 
     @a.dp.callback_query(F.data.startswith('u:'))
@@ -777,8 +856,8 @@ def install_owner(a):
                 reset(a.db, uid)
                 return await home(m)
         except Exception as exc:
-            a.logging.exception('Owner appearance action failed')
-            await show(m, 'Не удалось изменить оформление. ' + e(str(exc))[:500], [[('Оформление', 'u:home')]])
+            a.logging.exception('Не удалось изменить оформление')
+            await show(m, 'Не удалось изменить оформление. ' + e(user_error(exc))[:500], [[('Оформление', 'u:home')]])
     a.owner_design = home
     a.owner_design_input = consume
 
@@ -821,7 +900,7 @@ def install_chat_sync(a):
                 if await a.is_admin(linked, a.bot.id):
                     a.remember_chat(await a.bot.get_chat(linked))
             except Exception:
-                a.logging.info('Linked discussion unavailable')
+                a.logging.info('Связанная группа обсуждений недоступна')
         return chat
 
     async def sync(uid):
@@ -863,7 +942,7 @@ def install_chat_sync(a):
         try:
             chat = await add(share.chat_id, m.from_user.id)
         except Exception as exc:
-            await a.render(m, 'Не удалось подключить чат. ' + a.escape(str(exc))[:300], reply_markup=a.kb([[(text('05c2943f3f6b'), 's:choose')], [(text('c20945ceeebc'), 'p:home:0')]]))
+            await a.render(m, 'Не удалось подключить чат. ' + a.escape(user_error(exc))[:300], reply_markup=a.kb([[(text('05c2943f3f6b'), 's:choose')], [(text('c20945ceeebc'), 'p:home:0')]]))
             return
         a.db.execute('DELETE FROM chat_pick_requests WHERE user_id=?', (m.from_user.id,))
         a.db.commit()
